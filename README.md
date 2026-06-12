@@ -42,9 +42,12 @@ Laatste bevestigde runtime:
 ├── .vscode/
 └── docs/
     ├── images/
-    │   └── pcb-top-view.jpg
+  │   ├── pcb-top-view.jpg
+  │   └── sm_green_top.png
     ├── hardware/
-    │   └── Schematic_Aalfredkievit_1_v4_2025-12-30.pdf
+  │   ├── BOM_Aalfredkievit_1_v4_2026-02-02.csv
+  │   └── Schematic_Aalfredkievit_1_v4_2026-02-02.pdf
+  ├── Gerber_Aalfredkievit_1_v4_PCB_Aalfredkievit_1_v4_2026-02-02.zip
     ├── guides/
     │   ├── RAK3172_Bringup_Handleiding_Uitgebreid.pdf
     │   ├── RAK3172_Upload_UART_Handleiding.pdf
@@ -55,7 +58,7 @@ Laatste bevestigde runtime:
 
 ## Hardware en aansluitingen
 
-![PCB top view](docs/images/pcb-top-view.jpg)
+![PCB top view v2](docs/images/sm_green_top.png)
 
 Gebaseerd op schema en handleidingen:
 
@@ -161,7 +164,9 @@ Routeringstrategie uit bijlage:
 - Bring-up gids: [docs/guides/RAK3172_Bringup_Handleiding_Uitgebreid.pdf](docs/guides/RAK3172_Bringup_Handleiding_Uitgebreid.pdf)
 - UART upload handleiding: [docs/guides/RAK3172_Upload_UART_Handleiding.pdf](docs/guides/RAK3172_Upload_UART_Handleiding.pdf)
 - Node-RED routing bijlage: [docs/guides/RAK3172_NodeRED_Bijlage_PayloadRouting.pdf](docs/guides/RAK3172_NodeRED_Bijlage_PayloadRouting.pdf)
-- Hardware schema: [docs/hardware/Schematic_Aalfredkievit_1_v4_2025-12-30.pdf](docs/hardware/Schematic_Aalfredkievit_1_v4_2025-12-30.pdf)
+- Hardware BOM v2: [docs/hardware/BOM_Aalfredkievit_1_v4_2026-02-02.csv](docs/hardware/BOM_Aalfredkievit_1_v4_2026-02-02.csv)
+- Hardware schema v2: [docs/hardware/Schematic_Aalfredkievit_1_v4_2026-02-02.pdf](docs/hardware/Schematic_Aalfredkievit_1_v4_2026-02-02.pdf)
+- Gerber bestanden: [docs/Gerber_Aalfredkievit_1_v4_PCB_Aalfredkievit_1_v4_2026-02-02.zip](docs/Gerber_Aalfredkievit_1_v4_PCB_Aalfredkievit_1_v4_2026-02-02.zip)
 - Legacy VS Code notities: [docs/legacy/README_VSCODE.md](docs/legacy/README_VSCODE.md)
 
 ## Roadmap
