@@ -1,0 +1,6 @@
+{
+  "sketch": "RAK3172_Binaire_payload_rui.ino",
+  "board": "rak_rui:stm32:WisDuoRAK3172EvaluationBoard",
+  "configuration": "debug=l0,supportat=1,supportlora=2,supportAS923=2,supportAU915=2,supportCN470=2,supportCN779=2,supportEU433=2,supportEU868=1,supportKR920=2,supportIN865=2,supportUS915=2,supportRU864=2,supportLA915=2",
+  "output": "build"
+}

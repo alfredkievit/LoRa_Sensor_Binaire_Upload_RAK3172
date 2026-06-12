@@ -1,0 +1,13 @@
+# Build outputs
+build/
+
+# Arduino temp / IDE
+*.tmp
+*.log
+
+# Local secrets (do not commit real keys)
+arduino_secrets.h
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
