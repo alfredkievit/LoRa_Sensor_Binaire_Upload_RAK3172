@@ -14,6 +14,7 @@ Deze repository bevat:
 - [Repository-structuur](#repository-structuur)
 - [Hardware en aansluitingen](#hardware-en-aansluitingen)
 - [Firmwareconfiguratie](#firmwareconfiguratie)
+- [Uploaden vanuit VS Code (aanbevolen)](#uploaden-vanuit-vs-code-aanbevolen)
 - [Build en upload (Arduino CLI)](#build-en-upload-arduino-cli)
 - [LoRaWAN payload-formaat](#lorawan-payload-formaat)
 - [Node-RED / MQTT integratie](#node-red--mqtt-integratie)
@@ -86,7 +87,7 @@ Actuele productiesketch: `RAK3172_Binaire_payload_rui.ino`
 
 Belangrijk:
 - `JOIN_DIAGNOSTICS_ONLY = false` (echte data-uplink actief)
-- `SEND_INTERVAL_MS = 20 min`
+- `SEND_INTERVAL_MS = 15 min`
 - `LORA_FPORT = 1`
 - `LORA_CONFIRMED_UPLINK = false`
 
@@ -96,6 +97,38 @@ Pins in deze firmware (actieve code):
 - `BAT_ADC_PIN = PB3`
 - `O2_ADC_PIN = PB2`
 - `PWR_ENABLE_PIN = PA8`
+
+## Uploaden vanuit VS Code (aanbevolen)
+
+Deze repository is ingericht om direct via de VS Code Arduino-extensie te uploaden.
+
+### 1) Voorbereiding
+
+1. Open de workspace in VS Code.
+2. Controleer dat de extensie `Arduino` is geinstalleerd.
+3. Sluit andere tools die COM-poorten openhouden (bijv. Arduino IDE Serial Monitor).
+
+### 2) Board en poort
+
+De boardconfig staat in `.vscode/arduino.json`:
+- board: `rak_rui:stm32:WisDuoRAK3172EvaluationBoard`
+- sketch: `RAK3172_Binaire_payload_rui.ino`
+
+Selecteer daarna in VS Code de juiste seriele poort van de aangesloten node (meestal COM32).
+
+### 3) Upload
+
+1. Open de sketch `RAK3172_Binaire_payload_rui.ino`.
+2. Klik op `Upload` in de Arduino toolbar.
+3. Wacht op de melding dat upload voltooid is.
+
+### 4) Kalibratiemodus (optioneel)
+
+Voor kalibratie/debug bij boot:
+1. Houd `PA0` laag (naar GND) tijdens reset/power-up.
+2. Open Serial Monitor op 115200 baud.
+3. Stuur `c` + Enter om O2-kalibratie te starten.
+4. Laat `PA0` hoog bij normale productiebedrijf zonder seriele debugmodus.
 
 ## Build en upload (Arduino CLI)
 
