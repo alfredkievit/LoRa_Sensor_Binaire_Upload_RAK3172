@@ -37,25 +37,25 @@ Laatste bevestigde runtime:
 
 ```text
 .
-├── RAK3172_Binaire_payload_rui/
-│   ├── RAK3172_Binaire_payload_rui.ino
-│   ├── arduino_secrets.h
-│   └── arduino_secrets.example.h
-├── .vscode/
-└── docs/
-    ├── images/
-  │   ├── pcb-top-view.jpg
-  │   └── sm_green_top.png
-    ├── hardware/
-  │   ├── BOM_Aalfredkievit_1_v4_2026-02-02.csv
-  │   └── Schematic_Aalfredkievit_1_v4_2026-02-02.pdf
-  ├── Gerber_Aalfredkievit_1_v4_PCB_Aalfredkievit_1_v4_2026-02-02.zip
-    ├── guides/
-    │   ├── RAK3172_Bringup_Handleiding_Uitgebreid.pdf
-    │   ├── RAK3172_Upload_UART_Handleiding.pdf
-    │   └── RAK3172_NodeRED_Bijlage_PayloadRouting.pdf
-    └── legacy/
-        └── README_VSCODE.md
++-- RAK3172_Binaire_payload_rui/
+�   +-- RAK3172_Binaire_payload_rui.ino
+�   +-- arduino_secrets.h
+�   +-- arduino_secrets.example.h
++-- .vscode/
++-- docs/
+    +-- images/
+    �   +-- pcb-top-view.jpg
+    �   +-- sm_green_top.png
+    +-- hardware/
+    �   +-- BOM_Aalfredkievit_1_v4_2026-02-02.csv
+    �   +-- Schematic_Aalfredkievit_1_v4_2026-02-02.pdf
+    +-- Gerber_Aalfredkievit_1_v4_PCB_Aalfredkievit_1_v4_2026-02-02.zip
+    +-- guides/
+    �   +-- RAK3172_Bringup_Handleiding_Uitgebreid.pdf
+    �   +-- RAK3172_Upload_UART_Handleiding.pdf
+    �   +-- RAK3172_NodeRED_Bijlage_PayloadRouting.pdf
+    +-- legacy/
+        +-- README_VSCODE.md
 ```
 
 ## Hardware en aansluitingen
@@ -101,6 +101,7 @@ Pins in deze firmware (actieve code):
 - `BAT_ADC_PIN = PB3`
 - `O2_ADC_PIN = PB2`
 - `PWR_ENABLE_PIN = PA8`
+- `SERVICE_MODE_PIN = PA4` (headerpin bovenrand, gebruiken voor service/debug/kalibratie)
 
 ## Uploaden vanuit VS Code (aanbevolen)
 
@@ -128,11 +129,13 @@ Selecteer daarna in VS Code de juiste seriele poort van de aangesloten node (mee
 
 ### 4) Kalibratiemodus (optioneel)
 
-Voor kalibratie/debug bij boot:
-1. Houd `PA0` laag (naar GND) tijdens reset/power-up.
+Voor gebruiksvriendelijke service/debug bij boot:
+1. Verbind `PA4` kort met `GND` tijdens reset/power-up.
 2. Open Serial Monitor op 115200 baud.
-3. Stuur `c` + Enter om O2-kalibratie te starten.
-4. Laat `PA0` hoog bij normale productiebedrijf zonder seriele debugmodus.
+3. Voor automatische verse-lucht-kalibratie: houd `PA4` nog ongeveer 3 seconden laag na boot.
+4. Voor interactieve kalibratie: laat `PA4` daarna los en stuur `c` + Enter.
+5. `PA0` laag bij boot blijft als legacy trigger ondersteund.
+6. Laat servicepinnen hoog/open bij normale productiebedrijf zonder seriele debugmodus.
 
 ## Build en upload (Arduino CLI)
 

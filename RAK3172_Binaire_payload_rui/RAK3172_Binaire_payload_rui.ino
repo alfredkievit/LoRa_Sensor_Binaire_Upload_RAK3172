@@ -26,6 +26,7 @@ constexpr bool     JOIN_DIAGNOSTICS_ONLY     = false;
 constexpr bool     ENABLE_LOW_POWER_SLEEP    = !JOIN_DIAGNOSTICS_ONLY;
 constexpr uint32_t CAL_GAS_INPUT_TIMEOUT_MS  = 10000UL;
 constexpr uint32_t CAL_MODE_BOOT_WINDOW_MS   = 2000UL;
+constexpr uint32_t CAL_MODE_AUTO_START_MS    = 3000UL;
 constexpr bool     RECOVER_RAK_DEV_EUI       = false;
 // DevEUI now comes from chip unique ID, no factory override
 
@@ -36,6 +37,7 @@ constexpr bool     RECOVER_RAK_DEV_EUI       = false;
 #define O2_ADC_PIN          PB2
 #define PWR_ENABLE_PIN      PA8
 #define CAL_MODE_PIN        PA0
+#define SERVICE_MODE_PIN    PA4
 
 // ================= BME280 ADRESSEN =================
 #define BME280_ADDR          0x77
@@ -87,6 +89,7 @@ static_assert(sizeof(PayloadV1) == 8, "PayloadV1 must remain 8 bytes");
 // ================= RUNTIME STATE =================
 static bool     g_bme_ready = false;
 static bool     g_cal_mode = false;
+static bool     g_calibration_requested_at_boot = false;
 static bool     g_join_announced = false;
 static volatile bool    g_join_event_seen = false;
 static volatile int32_t g_last_join_status = INT32_MIN;
@@ -532,6 +535,27 @@ static bool read_serial_line_with_timeout(String &out, uint32_t timeout_ms) {
   return false;
 }
 
+static bool wait_for_pin_low_continuous(uint32_t pin, uint32_t duration_ms) {
+  uint32_t low_since = 0;
+  uint32_t start = millis();
+
+  while ((millis() - start) < duration_ms) {
+    if (digitalRead(pin) == LOW) {
+      if (low_since == 0) {
+        low_since = millis();
+      }
+      if ((millis() - low_since) >= duration_ms) {
+        return true;
+      }
+    } else {
+      low_since = 0;
+    }
+    delay(5);
+  }
+
+  return low_since != 0 && (millis() - low_since) >= duration_ms;
+}
+
 static void run_o2_calibration(float cal_gas_o2_pct) {
   Serial.printf("[CAL] Starting O2 calibration at %.2f%% O2...\r\n", cal_gas_o2_pct);
   Serial.println("[CAL] Keep sensor in stable calibration gas / fresh air");
@@ -854,9 +878,10 @@ static bool send_measurement_payload() {
 // ================= SETUP =================
 void setup() {
   pinMode(CAL_MODE_PIN, INPUT_PULLUP);
+  pinMode(SERVICE_MODE_PIN, INPUT_PULLUP);
   uint32_t trigger_start = millis();
   while ((millis() - trigger_start) < CAL_MODE_BOOT_WINDOW_MS) {
-    if (digitalRead(CAL_MODE_PIN) == LOW) {
+    if (digitalRead(CAL_MODE_PIN) == LOW || digitalRead(SERVICE_MODE_PIN) == LOW) {
       g_cal_mode = true;
       break;
     }
@@ -874,7 +899,10 @@ void setup() {
     Serial.println("=== RAK3172 RUI O2 + BME280 SENSOR   ===");
     Serial.println("=== VS Code / Join-first build       ===");
     Serial.println("========================================");
-    Serial.println("[MODE] Calibration/debug mode enabled (CAL_MODE_PIN held LOW at boot)");
+    Serial.println("[MODE] Calibration/debug mode enabled");
+    Serial.println("[MODE] Hold PA4 LOW at boot for service/debug mode");
+    Serial.println("[MODE] Keep PA4 LOW for 3s after boot to auto-start fresh-air calibration");
+    Serial.println("[MODE] Legacy trigger PA0 LOW at boot remains supported");
     log_rui_versions();
   }
 
@@ -912,7 +940,18 @@ void setup() {
   Serial.println("[SENS] Boot sanity check:");
   Serial.printf("  Battery: %.3f V (%u%%)\r\n", vbat, battery_percent(vbat));
   Serial.printf("  O2 raw:  %.2f %%\r\n", o2);
-  Serial.println("[CAL] Send 'c' in serial monitor to start O2 calibration");
+  Serial.println("[CAL] Hold PA4 LOW for 3s after boot to auto-start 20.9% calibration");
+  Serial.println("[CAL] Or send 'c' in serial monitor to start interactive calibration");
+
+  if (g_cal_mode && digitalRead(SERVICE_MODE_PIN) == LOW) {
+    Serial.println("[CAL] PA4 is LOW. Keep it LOW for 3s to auto-start calibration...");
+    if (wait_for_pin_low_continuous(SERVICE_MODE_PIN, CAL_MODE_AUTO_START_MS)) {
+      g_calibration_requested_at_boot = true;
+      Serial.println("[CAL] Auto-start calibration armed from PA4");
+    } else {
+      Serial.println("[CAL] Auto-start cancelled because PA4 was released");
+    }
+  }
 
   if (!configure_lorawan()) {
     Serial.println("[INIT] LoRaWAN configuration failed");
@@ -928,6 +967,11 @@ void setup() {
 // ================= LOOP =================
 void loop() {
   static uint32_t last_send_at = 0;
+
+  if (g_cal_mode && g_calibration_requested_at_boot) {
+    g_calibration_requested_at_boot = false;
+    run_o2_calibration(20.9f);
+  }
 
   if (g_cal_mode) {
     while (Serial.available() > 0) {
