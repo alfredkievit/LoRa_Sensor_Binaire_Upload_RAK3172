@@ -14,7 +14,7 @@
 #include "arduino_secrets.h"
 
 // ================= CONFIG =================
-constexpr uint32_t SEND_INTERVAL_MS          = 20UL * 60UL * 1000UL;
+constexpr uint32_t SEND_INTERVAL_MS          = 15UL * 60UL * 1000UL;
 constexpr uint32_t JOIN_ATTEMPT_TIMEOUT_MS   = 90UL * 1000UL;
 constexpr uint32_t JOIN_RETRY_DELAY_MS       = 5UL * 1000UL;
 constexpr uint32_t JOIN_POLL_INTERVAL_MS     = 2UL * 1000UL;
@@ -23,7 +23,11 @@ constexpr uint8_t  LORA_FPORT                = 1;
 constexpr bool     LORA_CONFIRMED_UPLINK     = false;
 constexpr uint8_t  LORA_SEND_RETRY           = 1;
 constexpr bool     JOIN_DIAGNOSTICS_ONLY     = false;
-constexpr bool     ENABLE_LOW_POWER_SLEEP    = false;
+constexpr bool     ENABLE_LOW_POWER_SLEEP    = !JOIN_DIAGNOSTICS_ONLY;
+constexpr uint32_t CAL_GAS_INPUT_TIMEOUT_MS  = 10000UL;
+constexpr uint32_t CAL_MODE_BOOT_WINDOW_MS   = 2000UL;
+constexpr bool     RECOVER_RAK_DEV_EUI       = false;
+// DevEUI now comes from chip unique ID, no factory override
 
 // ================= PINMAP =================
 #define I2C_SDA_PIN         PB7
@@ -31,6 +35,7 @@ constexpr bool     ENABLE_LOW_POWER_SLEEP    = false;
 #define BAT_ADC_PIN         PB3
 #define O2_ADC_PIN          PB2
 #define PWR_ENABLE_PIN      PA8
+#define CAL_MODE_PIN        PA0
 
 // ================= BME280 ADRESSEN =================
 #define BME280_ADDR          0x77
@@ -49,6 +54,7 @@ constexpr float VREF  = 3.3f;
 
 // ================= O2 =================
 constexpr float O2_VREF = 3.1714f;
+constexpr float O2_VOLTAGE_AT_20_9_PCT = 1.04f;
 
 // ================= STM32 UID =================
 #define UID64_BASE_ADDR 0x1FFF7580
@@ -80,11 +86,13 @@ static_assert(sizeof(PayloadV1) == 8, "PayloadV1 must remain 8 bytes");
 
 // ================= RUNTIME STATE =================
 static bool     g_bme_ready = false;
+static bool     g_cal_mode = false;
 static bool     g_join_announced = false;
 static volatile bool    g_join_event_seen = false;
 static volatile int32_t g_last_join_status = INT32_MIN;
 static volatile bool    g_send_event_seen = false;
 static volatile int32_t g_last_send_status = INT32_MIN;
+static float    g_o2_calibration_vref = O2_VOLTAGE_AT_20_9_PCT;
 
 // ================= STATUS HELPERS =================
 static const char *loramac_status_name(int32_t status) {
@@ -268,16 +276,19 @@ static void log_deveui() {
 
 static void ensure_valid_deveui() {
   uint8_t dev_eui[8] = {0};
+
   if (!api.lorawan.deui.get(dev_eui, sizeof(dev_eui))) {
     Serial.println("[LoRa] ERROR: Unable to read DevEUI for validation");
     return;
   }
 
+  // If chip already has a valid DevEUI (not all zeros), use it
   if (!eui_is_all_zero(dev_eui, sizeof(dev_eui))) {
-    Serial.println("[LoRa] DevEUI is already present in RUI state");
+    Serial.println("[LoRa] DevEUI is present in RUI state");
     return;
   }
 
+  // DevEUI is all zeros, generate one from STM32 unique ID
   uint8_t generated_dev_eui[8] = {0};
   read_hardware_uid64(generated_dev_eui);
 
@@ -494,8 +505,91 @@ static float read_o2_voltage() {
 static float read_o2_percent_raw() {
   // ME2-O2-20 + OPA333: Vout ~1.0V at 20.9% O2.
   // Formula: O2% = Vout * (20.9 / Vout_at_20.9%)
-  // Measured ~1.04V at 20.9%, so reference = 1.0V
-  return read_o2_voltage() * 0.21f / 1.0f * 100.0f;
+  // Measured ~1.04V at 20.9%, use that as calibration reference.
+  float ref = g_o2_calibration_vref;
+  if (ref < 0.05f) {
+    ref = O2_VOLTAGE_AT_20_9_PCT;
+  }
+  return read_o2_voltage() * (20.9f / ref);
+}
+
+static bool read_serial_line_with_timeout(String &out, uint32_t timeout_ms) {
+  out = "";
+  uint32_t start = millis();
+  while ((millis() - start) < timeout_ms) {
+    while (Serial.available() > 0) {
+      char c = (char)Serial.read();
+      if (c == '\r') {
+        continue;
+      }
+      if (c == '\n') {
+        return true;
+      }
+      out += c;
+    }
+    delay(5);
+  }
+  return false;
+}
+
+static void run_o2_calibration(float cal_gas_o2_pct) {
+  Serial.printf("[CAL] Starting O2 calibration at %.2f%% O2...\r\n", cal_gas_o2_pct);
+  Serial.println("[CAL] Keep sensor in stable calibration gas / fresh air");
+
+  const uint8_t samples = 20;
+  float sum_v = 0.0f;
+  for (uint8_t i = 0; i < samples; i++) {
+    float v = read_o2_voltage();
+    sum_v += v;
+    delay(50);
+  }
+
+  float avg_v = sum_v / (float)samples;
+  if (!isfinite(avg_v) || avg_v < 0.05f || avg_v > 3.0f) {
+    Serial.printf("[CAL] ERROR: Invalid calibration voltage %.4f V\r\n", avg_v);
+    return;
+  }
+
+  float new_ref = avg_v * (20.9f / cal_gas_o2_pct);
+  if (!isfinite(new_ref) || new_ref < 0.05f || new_ref > 3.0f) {
+    Serial.printf("[CAL] ERROR: Calculated reference is invalid %.4f V\r\n", new_ref);
+    return;
+  }
+
+  g_o2_calibration_vref = new_ref;
+  Serial.printf("[CAL] Measured average voltage: %.4f V\r\n", avg_v);
+  Serial.printf("[CAL] New runtime reference: %.4f V at 20.9%% O2\r\n", g_o2_calibration_vref);
+  Serial.printf("[CAL] Persist in code: O2_VOLTAGE_AT_20_9_PCT = %.4ff\r\n", g_o2_calibration_vref);
+}
+
+static void run_o2_calibration_interactive() {
+  float cal_gas_o2_pct = 20.9f;
+
+  Serial.println("[CAL] Calibration trigger received");
+  Serial.println("[CAL] Default gas = 20.9%. Enter other O2% + Enter within 10s, or wait");
+  Serial.print("[CAL] Input> ");
+
+  String line;
+  if (read_serial_line_with_timeout(line, CAL_GAS_INPUT_TIMEOUT_MS)) {
+    line.trim();
+    if (line.length() > 0) {
+      line.replace(',', '.');
+      float entered = line.toFloat();
+      if (entered > 0.0f && entered < 30.0f) {
+        cal_gas_o2_pct = entered;
+        Serial.printf("[CAL] Using entered gas: %.2f%%\r\n", cal_gas_o2_pct);
+      } else {
+        Serial.println("[CAL] Invalid input -> using 20.9%");
+      }
+    } else {
+      Serial.println("[CAL] Empty input -> using 20.9%");
+    }
+  } else {
+    Serial.println();
+    Serial.println("[CAL] No input -> using 20.9%");
+  }
+
+  run_o2_calibration(cal_gas_o2_pct);
 }
 
 // ================= PAYLOAD =================
@@ -759,16 +853,30 @@ static bool send_measurement_payload() {
 
 // ================= SETUP =================
 void setup() {
-  Serial.begin(115200, RAK_AT_MODE);
-  delay(1200);
+  pinMode(CAL_MODE_PIN, INPUT_PULLUP);
+  uint32_t trigger_start = millis();
+  while ((millis() - trigger_start) < CAL_MODE_BOOT_WINDOW_MS) {
+    if (digitalRead(CAL_MODE_PIN) == LOW) {
+      g_cal_mode = true;
+      break;
+    }
+    delay(5);
+  }
 
-  Serial.println();
-  Serial.println("========================================");
-  Serial.println("=== RAK3172 RUI O2 + BME280 SENSOR   ===");
-  Serial.println("=== VS Code / Join-first build       ===");
-  Serial.println("========================================");
+  if (g_cal_mode) {
+    Serial.begin(115200, RAK_AT_MODE);
+    delay(1200);
+  }
 
-  log_rui_versions();
+  if (g_cal_mode) {
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("=== RAK3172 RUI O2 + BME280 SENSOR   ===");
+    Serial.println("=== VS Code / Join-first build       ===");
+    Serial.println("========================================");
+    Serial.println("[MODE] Calibration/debug mode enabled (CAL_MODE_PIN held LOW at boot)");
+    log_rui_versions();
+  }
 
   pinMode(PWR_ENABLE_PIN, OUTPUT);
   digitalWrite(PWR_ENABLE_PIN, HIGH);
@@ -804,6 +912,7 @@ void setup() {
   Serial.println("[SENS] Boot sanity check:");
   Serial.printf("  Battery: %.3f V (%u%%)\r\n", vbat, battery_percent(vbat));
   Serial.printf("  O2 raw:  %.2f %%\r\n", o2);
+  Serial.println("[CAL] Send 'c' in serial monitor to start O2 calibration");
 
   if (!configure_lorawan()) {
     Serial.println("[INIT] LoRaWAN configuration failed");
@@ -820,6 +929,15 @@ void setup() {
 void loop() {
   static uint32_t last_send_at = 0;
 
+  if (g_cal_mode) {
+    while (Serial.available() > 0) {
+      char cmd = (char)Serial.read();
+      if (cmd == 'c' || cmd == 'C') {
+        run_o2_calibration_interactive();
+      }
+    }
+  }
+
   if (!ensure_joined()) {
     delay(JOIN_RETRY_DELAY_MS);
     return;
@@ -834,6 +952,8 @@ void loop() {
   uint32_t now = millis();
   if (last_send_at == 0 || (now - last_send_at) >= SEND_INTERVAL_MS) {
     last_send_at = now;
+    Serial.printf("[SEND] Uptime %.1f min, starting payload cycle\r\n",
+                  millis() / 60000.0f);
     send_measurement_payload();
     Serial.println("----------------------------------------");
   }

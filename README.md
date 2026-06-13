@@ -37,9 +37,10 @@ Laatste bevestigde runtime:
 
 ```text
 .
-├── RAK3172_Binaire_payload_rui.ino
-├── arduino_secrets.h
-├── arduino_secrets.example.h
+├── RAK3172_Binaire_payload_rui/
+│   ├── RAK3172_Binaire_payload_rui.ino
+│   ├── arduino_secrets.h
+│   └── arduino_secrets.example.h
 ├── .vscode/
 └── docs/
     ├── images/
@@ -83,13 +84,16 @@ Niet aansluiten op modulelogic:
 
 ## Firmwareconfiguratie
 
-Actuele productiesketch: `RAK3172_Binaire_payload_rui.ino`
+Actuele productiesketch:
+`RAK3172_Binaire_payload_rui/RAK3172_Binaire_payload_rui.ino`
 
 Belangrijk:
 - `JOIN_DIAGNOSTICS_ONLY = false` (echte data-uplink actief)
 - `SEND_INTERVAL_MS = 15 min`
 - `LORA_FPORT = 1`
 - `LORA_CONFIRMED_UPLINK = false`
+- Maak voor lokale builds `RAK3172_Binaire_payload_rui/arduino_secrets.h` aan op basis van
+  `RAK3172_Binaire_payload_rui/arduino_secrets.example.h`
 
 Pins in deze firmware (actieve code):
 - `I2C_SDA_PIN = PB7`
@@ -112,13 +116,13 @@ Deze repository is ingericht om direct via de VS Code Arduino-extensie te upload
 
 De boardconfig staat in `.vscode/arduino.json`:
 - board: `rak_rui:stm32:WisDuoRAK3172EvaluationBoard`
-- sketch: `RAK3172_Binaire_payload_rui.ino`
+- sketch: `RAK3172_Binaire_payload_rui/RAK3172_Binaire_payload_rui.ino`
 
 Selecteer daarna in VS Code de juiste seriele poort van de aangesloten node (meestal COM32).
 
 ### 3) Upload
 
-1. Open de sketch `RAK3172_Binaire_payload_rui.ino`.
+1. Open de sketch `RAK3172_Binaire_payload_rui/RAK3172_Binaire_payload_rui.ino`.
 2. Klik op `Upload` in de Arduino toolbar.
 3. Wacht op de melding dat upload voltooid is.
 
@@ -138,7 +142,7 @@ Voor kalibratie/debug bij boot:
 arduino-cli compile \
   --fqbn "rak_rui:stm32:WisDuoRAK3172EvaluationBoard:debug=l0,supportat=1,supportlora=2,supportAS923=2,supportAU915=2,supportCN470=2,supportCN779=2,supportEU433=2,supportEU868=1,supportKR920=2,supportIN865=2,supportUS915=2,supportRU864=2,supportLA915=2" \
   --output-dir build/cli_join_test \
-  .
+  ./RAK3172_Binaire_payload_rui
 ```
 
 ### 2) Upload
@@ -148,7 +152,7 @@ arduino-cli upload \
   -p COM32 \
   --fqbn "rak_rui:stm32:WisDuoRAK3172EvaluationBoard:debug=l0,supportat=1,supportlora=2,supportAS923=2,supportAU915=2,supportCN470=2,supportCN779=2,supportEU433=2,supportEU868=1,supportKR920=2,supportIN865=2,supportUS915=2,supportRU864=2,supportLA915=2" \
   --input-dir build/cli_join_test \
-  .
+  ./RAK3172_Binaire_payload_rui
 ```
 
 ### 3) UART boot-volgorde (indien nodig)

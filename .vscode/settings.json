@@ -1,4 +1,5 @@
 {
+  "arduino.useArduinoCli": true,
   "arduino.additionalUrls": [
     "https://raw.githubusercontent.com/RAKWireless/RAKwireless-Arduino-BSP-Index/main/package_rakwireless_com_rui_index.json"
   ]
