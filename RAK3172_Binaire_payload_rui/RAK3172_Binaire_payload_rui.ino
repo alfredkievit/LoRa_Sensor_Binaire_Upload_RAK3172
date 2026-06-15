@@ -24,9 +24,11 @@ constexpr bool     LORA_CONFIRMED_UPLINK     = false;
 constexpr uint8_t  LORA_SEND_RETRY           = 1;
 constexpr bool     JOIN_DIAGNOSTICS_ONLY     = false;
 constexpr bool     ENABLE_LOW_POWER_SLEEP    = !JOIN_DIAGNOSTICS_ONLY;
-constexpr uint32_t CAL_GAS_INPUT_TIMEOUT_MS  = 10000UL;
-constexpr uint32_t CAL_MODE_BOOT_WINDOW_MS   = 2000UL;
-constexpr uint32_t CAL_MODE_AUTO_START_MS    = 3000UL;
+constexpr uint32_t CAL_GAS_INPUT_TIMEOUT_MS  = 5000UL;
+constexpr uint32_t DEBUG_BOOT_WINDOW_MS      = 2000UL;
+constexpr uint32_t DEBUG_O2_LOG_INTERVAL_MS  = 30000UL;
+constexpr uint8_t  O2_STABILIZED_SAMPLES     = 20;
+constexpr uint32_t O2_STABILIZED_DELAY_MS    = 50UL;
 constexpr bool     RECOVER_RAK_DEV_EUI       = false;
 // DevEUI now comes from chip unique ID, no factory override
 
@@ -36,7 +38,6 @@ constexpr bool     RECOVER_RAK_DEV_EUI       = false;
 #define BAT_ADC_PIN         PB3
 #define O2_ADC_PIN          PB2
 #define PWR_ENABLE_PIN      PA8
-#define CAL_MODE_PIN        PA0
 #define SERVICE_MODE_PIN    PA4
 
 // ================= BME280 ADRESSEN =================
@@ -88,14 +89,17 @@ static_assert(sizeof(PayloadV1) == 8, "PayloadV1 must remain 8 bytes");
 
 // ================= RUNTIME STATE =================
 static bool     g_bme_ready = false;
-static bool     g_cal_mode = false;
-static bool     g_calibration_requested_at_boot = false;
+static bool     g_debug_mode = false;
 static bool     g_join_announced = false;
 static volatile bool    g_join_event_seen = false;
 static volatile int32_t g_last_join_status = INT32_MIN;
 static volatile bool    g_send_event_seen = false;
 static volatile int32_t g_last_send_status = INT32_MIN;
 static float    g_o2_calibration_vref = O2_VOLTAGE_AT_20_9_PCT;
+
+#define DBG_PRINT(x) do { if (g_debug_mode) { Serial.print(x); } } while (0)
+#define DBG_PRINTLN(x) do { if (g_debug_mode) { Serial.println(x); } } while (0)
+#define DBG_PRINTF(...) do { if (g_debug_mode) { Serial.printf(__VA_ARGS__); } } while (0)
 
 // ================= STATUS HELPERS =================
 static const char *loramac_status_name(int32_t status) {
@@ -187,22 +191,30 @@ static bool bytes_equal(const uint8_t *lhs, const uint8_t *rhs, size_t len) {
 void joinCallback(int32_t status) {
   g_join_event_seen = true;
   g_last_join_status = status;
-  Serial.printf("[JOIN] Callback status=%ld (%s)\r\n",
-                (long)status, loramac_status_name(status));
+  DBG_PRINTF("[JOIN] Callback status=%ld (%s)\r\n",
+             (long)status, loramac_status_name(status));
 }
 
 void sendCallback(int32_t status) {
   g_send_event_seen = true;
   g_last_send_status = status;
-  Serial.printf("[SEND] Callback status=%ld (%s)\r\n",
-                (long)status, loramac_status_name(status));
+  DBG_PRINTF("[SEND] Callback status=%ld (%s)\r\n",
+             (long)status, loramac_status_name(status));
 }
 
 // ================= HELPERS =================
 static void print_hex_compact(const uint8_t *data, size_t len) {
   for (size_t i = 0; i < len; i++) {
-    Serial.printf("%02X", data[i]);
+    DBG_PRINTF("%02X", data[i]);
   }
+}
+
+static void sensor_power_on() {
+  digitalWrite(PWR_ENABLE_PIN, HIGH);
+}
+
+static void sensor_power_off() {
+  digitalWrite(PWR_ENABLE_PIN, LOW);
 }
 
 static int hex_nibble(char c) {
@@ -237,43 +249,43 @@ static bool hex_to_bytes(const char *hex, uint8_t *out, size_t out_len) {
 static bool validate_and_log_secrets() {
   bool ok = true;
 
-  Serial.println("[SECRETS] Validating JoinEUI/AppKey...");
+  DBG_PRINTLN("[SECRETS] Validating JoinEUI/AppKey...");
 
   if (!is_hex_string(SECRET_APP_EUI, 16)) {
-    Serial.println("[SECRETS] ERROR: SECRET_APP_EUI must be exactly 16 hex chars");
+    DBG_PRINTLN("[SECRETS] ERROR: SECRET_APP_EUI must be exactly 16 hex chars");
     ok = false;
   } else {
-    Serial.println("[SECRETS] JoinEUI/AppEUI format OK");
+    DBG_PRINTLN("[SECRETS] JoinEUI/AppEUI format OK");
   }
 
   if (!is_hex_string(SECRET_APP_KEY, 32)) {
-    Serial.println("[SECRETS] ERROR: SECRET_APP_KEY must be exactly 32 hex chars");
+    DBG_PRINTLN("[SECRETS] ERROR: SECRET_APP_KEY must be exactly 32 hex chars");
     ok = false;
   } else {
-    Serial.println("[SECRETS] AppKey format OK");
+    DBG_PRINTLN("[SECRETS] AppKey format OK");
   }
 
   return ok;
 }
 
 static void log_rui_versions() {
-  Serial.println("[RUI] Runtime versions:");
-  Serial.printf("  Firmware: %s\r\n", api.system.firmwareVersion.get().c_str());
-  Serial.printf("  CLI:      %s\r\n", api.system.cliVersion.get().c_str());
-  Serial.printf("  API:      %s\r\n", api.system.apiVersion.get().c_str());
-  Serial.printf("  LoRaWAN:  %s\r\n", api.lorawan.ver.get().c_str());
-  Serial.printf("  Model:    %s\r\n", api.system.modelId.get().c_str());
-  Serial.printf("  Chip ID:  %s\r\n", api.system.chipId.get().c_str());
+  DBG_PRINTLN("[RUI] Runtime versions:");
+  DBG_PRINTF("  Firmware: %s\r\n", api.system.firmwareVersion.get().c_str());
+  DBG_PRINTF("  CLI:      %s\r\n", api.system.cliVersion.get().c_str());
+  DBG_PRINTF("  API:      %s\r\n", api.system.apiVersion.get().c_str());
+  DBG_PRINTF("  LoRaWAN:  %s\r\n", api.lorawan.ver.get().c_str());
+  DBG_PRINTF("  Model:    %s\r\n", api.system.modelId.get().c_str());
+  DBG_PRINTF("  Chip ID:  %s\r\n", api.system.chipId.get().c_str());
 }
 
 static void log_deveui() {
   uint8_t dev_eui[8] = {0};
   if (api.lorawan.deui.get(dev_eui, sizeof(dev_eui))) {
-    Serial.print("[LoRa] DevEUI: ");
+    DBG_PRINT("[LoRa] DevEUI: ");
     print_hex_compact(dev_eui, sizeof(dev_eui));
-    Serial.println();
+    DBG_PRINTLN("");
   } else {
-    Serial.println("[LoRa] ERROR: Unable to read DevEUI");
+    DBG_PRINTLN("[LoRa] ERROR: Unable to read DevEUI");
   }
 }
 
@@ -281,13 +293,13 @@ static void ensure_valid_deveui() {
   uint8_t dev_eui[8] = {0};
 
   if (!api.lorawan.deui.get(dev_eui, sizeof(dev_eui))) {
-    Serial.println("[LoRa] ERROR: Unable to read DevEUI for validation");
+    DBG_PRINTLN("[LoRa] ERROR: Unable to read DevEUI for validation");
     return;
   }
 
   // If chip already has a valid DevEUI (not all zeros), use it
   if (!eui_is_all_zero(dev_eui, sizeof(dev_eui))) {
-    Serial.println("[LoRa] DevEUI is present in RUI state");
+    DBG_PRINTLN("[LoRa] DevEUI is present in RUI state");
     return;
   }
 
@@ -295,43 +307,43 @@ static void ensure_valid_deveui() {
   uint8_t generated_dev_eui[8] = {0};
   read_hardware_uid64(generated_dev_eui);
 
-  Serial.print("[LoRa] DevEUI is 0000000000000000, generating from STM32 UID64: ");
+  DBG_PRINT("[LoRa] DevEUI is 0000000000000000, generating from STM32 UID64: ");
   print_hex_compact(generated_dev_eui, sizeof(generated_dev_eui));
-  Serial.println();
+  DBG_PRINTLN("");
 
   if (!api.lorawan.deui.set(generated_dev_eui, sizeof(generated_dev_eui))) {
-    Serial.println("[LoRa] ERROR: Failed to set generated DevEUI");
+    DBG_PRINTLN("[LoRa] ERROR: Failed to set generated DevEUI");
     return;
   }
 
-  Serial.println("[LoRa] Generated DevEUI applied");
+  DBG_PRINTLN("[LoRa] Generated DevEUI applied");
 }
 
 static void log_appeui() {
   uint8_t app_eui[8] = {0};
   if (api.lorawan.appeui.get(app_eui, sizeof(app_eui))) {
-    Serial.print("[LoRa] JoinEUI/AppEUI: ");
+    DBG_PRINT("[LoRa] JoinEUI/AppEUI: ");
     print_hex_compact(app_eui, sizeof(app_eui));
-    Serial.println();
+    DBG_PRINTLN("");
   } else {
-    Serial.println("[LoRa] ERROR: Unable to read AppEUI");
+    DBG_PRINTLN("[LoRa] ERROR: Unable to read AppEUI");
   }
 }
 
 static void log_lorawan_runtime_config() {
-  Serial.println("[LoRa] Runtime configuration:");
-  Serial.printf("  Net mode:  %s\r\n", network_mode_name(api.lorawan.nwm.get() == 1));
-  Serial.printf("  Mode:      %s\r\n", join_mode_name(api.lorawan.njm.get()));
-  Serial.printf("  Region:    %s (%ld)\r\n",
-                region_name(api.lorawan.band.get()),
-                (long)api.lorawan.band.get());
-  Serial.printf("  Class:     %s\r\n", class_name(api.lorawan.deviceClass.get()));
-  Serial.printf("  ADR:       %s\r\n", api.lorawan.adr.get() ? "ON" : "OFF");
-  Serial.printf("  DR:        %u\r\n", api.lorawan.dr.get());
-  Serial.printf("  TX Power:  %u dBm\r\n", api.lorawan.txp.get());
-  Serial.printf("  Confirmed: %s\r\n", api.lorawan.cfm.get() ? "YES" : "NO");
-  Serial.printf("  Retry:     %u\r\n", api.lorawan.rety.get());
-  Serial.printf("  Joined:    %s\r\n", api.lorawan.njs.get() ? "YES" : "NO");
+  DBG_PRINTLN("[LoRa] Runtime configuration:");
+  DBG_PRINTF("  Net mode:  %s\r\n", network_mode_name(api.lorawan.nwm.get() == 1));
+  DBG_PRINTF("  Mode:      %s\r\n", join_mode_name(api.lorawan.njm.get()));
+  DBG_PRINTF("  Region:    %s (%ld)\r\n",
+             region_name(api.lorawan.band.get()),
+             (long)api.lorawan.band.get());
+  DBG_PRINTF("  Class:     %s\r\n", class_name(api.lorawan.deviceClass.get()));
+  DBG_PRINTF("  ADR:       %s\r\n", api.lorawan.adr.get() ? "ON" : "OFF");
+  DBG_PRINTF("  DR:        %u\r\n", api.lorawan.dr.get());
+  DBG_PRINTF("  TX Power:  %u dBm\r\n", api.lorawan.txp.get());
+  DBG_PRINTF("  Confirmed: %s\r\n", api.lorawan.cfm.get() ? "YES" : "NO");
+  DBG_PRINTF("  Retry:     %u\r\n", api.lorawan.rety.get());
+  DBG_PRINTF("  Joined:    %s\r\n", api.lorawan.njs.get() ? "YES" : "NO");
 }
 
 static bool allow_failed_set_if_value_matches(const char *label,
@@ -340,14 +352,14 @@ static bool allow_failed_set_if_value_matches(const char *label,
                                               uint32_t expected_value) {
   if (set_ok) return true;
   if (current_value == expected_value) {
-    Serial.printf("[LoRa] %s already matches desired value, continuing\r\n", label);
+    DBG_PRINTF("[LoRa] %s already matches desired value, continuing\r\n", label);
     return true;
   }
 
-  Serial.printf("[LoRa] ERROR: failed to set %s (current=%lu expected=%lu)\r\n",
-                label,
-                (unsigned long)current_value,
-                (unsigned long)expected_value);
+  DBG_PRINTF("[LoRa] ERROR: failed to set %s (current=%lu expected=%lu)\r\n",
+             label,
+             (unsigned long)current_value,
+             (unsigned long)expected_value);
   return false;
 }
 
@@ -359,11 +371,11 @@ static bool allow_failed_set_if_bytes_match(const char *label,
                                             size_t len) {
   if (set_ok) return true;
   if (get_ok && bytes_equal(current_value, expected_value, len)) {
-    Serial.printf("[LoRa] %s already matches desired value, continuing\r\n", label);
+    DBG_PRINTF("[LoRa] %s already matches desired value, continuing\r\n", label);
     return true;
   }
 
-  Serial.printf("[LoRa] ERROR: failed to set %s and readback does not match\r\n", label);
+  DBG_PRINTF("[LoRa] ERROR: failed to set %s and readback does not match\r\n", label);
   return false;
 }
 
@@ -417,11 +429,11 @@ static bool bme280_init() {
 
   uint8_t chipid = bme280_read_reg(BME280_REG_CHIPID);
   if (chipid != BME280_CHIPID) {
-    Serial.printf("[BME] Wrong chip ID: 0x%02X (expected 0x60)\r\n", chipid);
+    DBG_PRINTF("[BME] Wrong chip ID: 0x%02X (expected 0x60)\r\n", chipid);
     return false;
   }
 
-  Serial.printf("[BME] Chip ID OK: 0x%02X\r\n", chipid);
+  DBG_PRINTF("[BME] Chip ID OK: 0x%02X\r\n", chipid);
   bme280_read_coefficients();
   bme280_write_reg(BME280_REG_CTRL_HUM, 0x01);
   bme280_write_reg(BME280_REG_CTRL_MEAS, 0x27);
@@ -516,8 +528,29 @@ static float read_o2_percent_raw() {
   return read_o2_voltage() * (20.9f / ref);
 }
 
+static float read_o2_voltage_stabilized() {
+  float sum_v = 0.0f;
+  for (uint8_t i = 0; i < O2_STABILIZED_SAMPLES; i++) {
+    sum_v += read_o2_voltage();
+    delay(O2_STABILIZED_DELAY_MS);
+  }
+  return sum_v / (float)O2_STABILIZED_SAMPLES;
+}
+
+static float read_o2_percent_raw_stabilized() {
+  float ref = g_o2_calibration_vref;
+  if (ref < 0.05f) {
+    ref = O2_VOLTAGE_AT_20_9_PCT;
+  }
+  return read_o2_voltage_stabilized() * (20.9f / ref);
+}
+
 static bool read_serial_line_with_timeout(String &out, uint32_t timeout_ms) {
   out = "";
+  while (Serial.available() > 0) {
+    (void)Serial.read();
+  }
+
   uint32_t start = millis();
   while ((millis() - start) < timeout_ms) {
     while (Serial.available() > 0) {
@@ -557,41 +590,33 @@ static bool wait_for_pin_low_continuous(uint32_t pin, uint32_t duration_ms) {
 }
 
 static void run_o2_calibration(float cal_gas_o2_pct) {
-  Serial.printf("[CAL] Starting O2 calibration at %.2f%% O2...\r\n", cal_gas_o2_pct);
-  Serial.println("[CAL] Keep sensor in stable calibration gas / fresh air");
+  DBG_PRINTF("[CAL] Starting O2 calibration at %.2f%% O2...\r\n", cal_gas_o2_pct);
+  DBG_PRINTLN("[CAL] Keep sensor in stable calibration gas / fresh air");
 
-  const uint8_t samples = 20;
-  float sum_v = 0.0f;
-  for (uint8_t i = 0; i < samples; i++) {
-    float v = read_o2_voltage();
-    sum_v += v;
-    delay(50);
-  }
-
-  float avg_v = sum_v / (float)samples;
+  float avg_v = read_o2_voltage_stabilized();
   if (!isfinite(avg_v) || avg_v < 0.05f || avg_v > 3.0f) {
-    Serial.printf("[CAL] ERROR: Invalid calibration voltage %.4f V\r\n", avg_v);
+    DBG_PRINTF("[CAL] ERROR: Invalid calibration voltage %.4f V\r\n", avg_v);
     return;
   }
 
   float new_ref = avg_v * (20.9f / cal_gas_o2_pct);
   if (!isfinite(new_ref) || new_ref < 0.05f || new_ref > 3.0f) {
-    Serial.printf("[CAL] ERROR: Calculated reference is invalid %.4f V\r\n", new_ref);
+    DBG_PRINTF("[CAL] ERROR: Calculated reference is invalid %.4f V\r\n", new_ref);
     return;
   }
 
   g_o2_calibration_vref = new_ref;
-  Serial.printf("[CAL] Measured average voltage: %.4f V\r\n", avg_v);
-  Serial.printf("[CAL] New runtime reference: %.4f V at 20.9%% O2\r\n", g_o2_calibration_vref);
-  Serial.printf("[CAL] Persist in code: O2_VOLTAGE_AT_20_9_PCT = %.4ff\r\n", g_o2_calibration_vref);
+  DBG_PRINTF("[CAL] Measured average voltage: %.4f V\r\n", avg_v);
+  DBG_PRINTF("[CAL] New runtime reference: %.4f V at 20.9%% O2\r\n", g_o2_calibration_vref);
+  DBG_PRINTF("[CAL] Persist in code: O2_VOLTAGE_AT_20_9_PCT = %.4ff\r\n", g_o2_calibration_vref);
 }
 
-static void run_o2_calibration_interactive() {
+static void run_o2_calibration_from_boot_prompt() {
   float cal_gas_o2_pct = 20.9f;
 
-  Serial.println("[CAL] Calibration trigger received");
-  Serial.println("[CAL] Default gas = 20.9%. Enter other O2% + Enter within 10s, or wait");
-  Serial.print("[CAL] Input> ");
+  DBG_PRINTLN("[CAL] Waiting 5 seconds for optional calibration gas input...");
+  DBG_PRINTLN("[CAL] Enter O2% + Enter within 5s, or wait for default 20.90%");
+  DBG_PRINT("[CAL] Input> ");
 
   String line;
   if (read_serial_line_with_timeout(line, CAL_GAS_INPUT_TIMEOUT_MS)) {
@@ -601,16 +626,16 @@ static void run_o2_calibration_interactive() {
       float entered = line.toFloat();
       if (entered > 0.0f && entered < 30.0f) {
         cal_gas_o2_pct = entered;
-        Serial.printf("[CAL] Using entered gas: %.2f%%\r\n", cal_gas_o2_pct);
+        DBG_PRINTF("[CAL] Using entered gas: %.2f%%\r\n", cal_gas_o2_pct);
       } else {
-        Serial.println("[CAL] Invalid input -> using 20.9%");
+        DBG_PRINTLN("[CAL] Invalid input -> using 20.90%");
       }
     } else {
-      Serial.println("[CAL] Empty input -> using 20.9%");
+      DBG_PRINTLN("[CAL] Empty input -> using 20.90%");
     }
   } else {
-    Serial.println();
-    Serial.println("[CAL] No input -> using 20.9%");
+    DBG_PRINTLN("");
+    DBG_PRINTLN("[CAL] No input -> using 20.90%");
   }
 
   run_o2_calibration(cal_gas_o2_pct);
@@ -642,34 +667,34 @@ static void log_payload_preview(const PayloadV1 &payload,
                                 float temp_c,
                                 float humidity_pct,
                                 float vbat) {
-  Serial.println("[PAYLOAD] Preview:");
-  Serial.printf("  Raw O2:       %.2f %%\r\n", o2_raw);
-  Serial.printf("  Temperature:  %.2f C\r\n", temp_c);
-  Serial.printf("  Humidity:     %.2f %%RH\r\n", humidity_pct);
-  Serial.printf("  Battery:      %.3f V (%u%%)\r\n", vbat, payload.bat_pct);
-  Serial.printf("  msgType:      0x%02X\r\n", payload.msgType);
-  Serial.printf("  o2_x10:       %u\r\n", payload.o2_x10);
-  Serial.printf("  t_x10:        %d\r\n", payload.t_x10);
-  Serial.printf("  h_x10:        %u\r\n", payload.h_x10);
-  Serial.print("  Bytes:        ");
+  DBG_PRINTLN("[PAYLOAD] Preview:");
+  DBG_PRINTF("  Raw O2:       %.2f %%\r\n", o2_raw);
+  DBG_PRINTF("  Temperature:  %.2f C\r\n", temp_c);
+  DBG_PRINTF("  Humidity:     %.2f %%RH\r\n", humidity_pct);
+  DBG_PRINTF("  Battery:      %.3f V (%u%%)\r\n", vbat, payload.bat_pct);
+  DBG_PRINTF("  msgType:      0x%02X\r\n", payload.msgType);
+  DBG_PRINTF("  o2_x10:       %u\r\n", payload.o2_x10);
+  DBG_PRINTF("  t_x10:        %d\r\n", payload.t_x10);
+  DBG_PRINTF("  h_x10:        %u\r\n", payload.h_x10);
+  DBG_PRINT("  Bytes:        ");
   print_hex_compact((const uint8_t *)&payload, sizeof(payload));
-  Serial.println();
+  DBG_PRINTLN("");
 }
 
 // ================= LORAWAN =================
 static bool ensure_lorawan_mode() {
   if (api.lorawan.nwm.get() == 1) {
-    Serial.println("[LoRa] Device already in LoRaWAN mode");
+    DBG_PRINTLN("[LoRa] Device already in LoRaWAN mode");
     return true;
   }
 
-  Serial.println("[LoRa] Device is in P2P mode, switching to LoRaWAN and rebooting...");
+  DBG_PRINTLN("[LoRa] Device is in P2P mode, switching to LoRaWAN and rebooting...");
   if (!api.lorawan.nwm.set()) {
-    Serial.println("[LoRa] ERROR: failed to switch device to LoRaWAN mode");
+    DBG_PRINTLN("[LoRa] ERROR: failed to switch device to LoRaWAN mode");
     return false;
   }
 
-  Serial.println("[LoRa] Mode changed, rebooting now");
+  DBG_PRINTLN("[LoRa] Mode changed, rebooting now");
   delay(250);
   api.system.reboot();
   while (true) {
@@ -690,11 +715,11 @@ static bool configure_lorawan() {
   uint8_t app_key[16] = {0};
 
   if (!hex_to_bytes(SECRET_APP_EUI, app_eui, sizeof(app_eui))) {
-    Serial.println("[LoRa] ERROR: could not parse SECRET_APP_EUI");
+    DBG_PRINTLN("[LoRa] ERROR: could not parse SECRET_APP_EUI");
     return false;
   }
   if (!hex_to_bytes(SECRET_APP_KEY, app_key, sizeof(app_key))) {
-    Serial.println("[LoRa] ERROR: could not parse SECRET_APP_KEY");
+    DBG_PRINTLN("[LoRa] ERROR: could not parse SECRET_APP_KEY");
     return false;
   }
 
@@ -703,39 +728,39 @@ static bool configure_lorawan() {
   api.lorawan.registerJoinCallback(joinCallback);
 
   if (!api.lorawan.band.set(RAK_REGION_EU868)) {
-    Serial.println("[LoRa] ERROR: failed to set region EU868");
+    DBG_PRINTLN("[LoRa] ERROR: failed to set region EU868");
     return false;
   }
   if (!api.lorawan.deviceClass.set(RAK_LORA_CLASS_A)) {
-    Serial.println("[LoRa] ERROR: failed to set Class A");
+    DBG_PRINTLN("[LoRa] ERROR: failed to set Class A");
     return false;
   }
   if (!api.lorawan.njm.set(RAK_LORA_OTAA)) {
-    Serial.println("[LoRa] ERROR: failed to set OTAA mode");
+    DBG_PRINTLN("[LoRa] ERROR: failed to set OTAA mode");
     return false;
   }
   if (!api.lorawan.appeui.set(app_eui, sizeof(app_eui))) {
-    Serial.println("[LoRa] ERROR: failed to set JoinEUI/AppEUI");
+    DBG_PRINTLN("[LoRa] ERROR: failed to set JoinEUI/AppEUI");
     return false;
   }
   if (!api.lorawan.appkey.set(app_key, sizeof(app_key))) {
-    Serial.println("[LoRa] ERROR: failed to set AppKey");
+    DBG_PRINTLN("[LoRa] ERROR: failed to set AppKey");
     return false;
   }
   if (!api.lorawan.adr.set(true)) {
-    Serial.println("[LoRa] ERROR: failed to set ADR");
+    DBG_PRINTLN("[LoRa] ERROR: failed to set ADR");
     return false;
   }
   if (!api.lorawan.cfm.set(LORA_CONFIRMED_UPLINK ? 1 : 0)) {
-    Serial.println("[LoRa] ERROR: failed to set confirmed mode");
+    DBG_PRINTLN("[LoRa] ERROR: failed to set confirmed mode");
     return false;
   }
   if (!api.lorawan.rety.set(LORA_SEND_RETRY)) {
-    Serial.println("[LoRa] ERROR: failed to set retry count");
+    DBG_PRINTLN("[LoRa] ERROR: failed to set retry count");
     return false;
   }
 
-  Serial.println("[LoRa] Join identity after configuration:");
+  DBG_PRINTLN("[LoRa] Join identity after configuration:");
   log_deveui();
   log_appeui();
   log_lorawan_runtime_config();
@@ -743,57 +768,57 @@ static bool configure_lorawan() {
 }
 static bool run_join_attempts() {
   for (uint8_t attempt = 1; attempt <= JOIN_MAX_ATTEMPTS; attempt++) {
-    Serial.printf("[JOIN] Attempt %u/%u: starting OTAA join...\r\n",
-                  attempt, JOIN_MAX_ATTEMPTS);
+    DBG_PRINTF("[JOIN] Attempt %u/%u: starting OTAA join...\r\n",
+               attempt, JOIN_MAX_ATTEMPTS);
 
     g_join_event_seen = false;
     g_last_join_status = INT32_MIN;
 
     if (!api.lorawan.join()) {
-      Serial.println("[JOIN] Start failed: join request was not accepted by the stack");
+      DBG_PRINTLN("[JOIN] Start failed: join request was not accepted by the stack");
       if (attempt < JOIN_MAX_ATTEMPTS) {
         delay(JOIN_RETRY_DELAY_MS);
       }
       continue;
     }
 
-    Serial.printf("[JOIN] Start accepted, waiting up to %lu seconds for join accept...\r\n",
-            JOIN_ATTEMPT_TIMEOUT_MS / 1000UL);
+    DBG_PRINTF("[JOIN] Start accepted, waiting up to %lu seconds for join accept...\r\n",
+               JOIN_ATTEMPT_TIMEOUT_MS / 1000UL);
 
     uint32_t started_at = millis();
     uint32_t last_progress_log = started_at;
 
     while ((millis() - started_at) < JOIN_ATTEMPT_TIMEOUT_MS) {
       if (api.lorawan.njs.get()) {
-        Serial.println("[JOIN] Join complete: network session is active");
+        DBG_PRINTLN("[JOIN] Join complete: network session is active");
         g_join_announced = true;
         return true;
       }
 
       if ((millis() - last_progress_log) >= 10000UL) {
-        Serial.println("[JOIN] Waiting for accept...");
+        DBG_PRINTLN("[JOIN] Waiting for accept...");
         last_progress_log = millis();
       }
       delay(JOIN_POLL_INTERVAL_MS);
     }
 
     if (api.lorawan.njs.get()) {
-      Serial.println("[JOIN] Join complete after final state check");
+      DBG_PRINTLN("[JOIN] Join complete after final state check");
       g_join_announced = true;
       return true;
     }
 
     if (g_join_event_seen) {
-      Serial.printf("[JOIN] Attempt %u ended without session, callback=%s\r\n",
-                    attempt, loramac_status_name(g_last_join_status));
+      DBG_PRINTF("[JOIN] Attempt %u ended without session, callback=%s\r\n",
+                 attempt, loramac_status_name(g_last_join_status));
     } else {
-      Serial.printf("[JOIN] Attempt %u timed out: join started but no accept was observed\r\n",
-                    attempt);
+      DBG_PRINTF("[JOIN] Attempt %u timed out: join started but no accept was observed\r\n",
+                 attempt);
     }
 
     if (attempt < JOIN_MAX_ATTEMPTS) {
-      Serial.printf("[JOIN] Retrying in %lu seconds...\r\n",
-                    JOIN_RETRY_DELAY_MS / 1000UL);
+      DBG_PRINTF("[JOIN] Retrying in %lu seconds...\r\n",
+                 JOIN_RETRY_DELAY_MS / 1000UL);
       delay(JOIN_RETRY_DELAY_MS);
     }
   }
@@ -804,7 +829,7 @@ static bool run_join_attempts() {
 static bool ensure_joined() {
   if (api.lorawan.njs.get()) {
     if (!g_join_announced) {
-      Serial.println("[JOIN] Network already joined");
+      DBG_PRINTLN("[JOIN] Network already joined");
       g_join_announced = true;
     }
     return true;
@@ -814,7 +839,7 @@ static bool ensure_joined() {
     return true;
   }
 
-  Serial.println("[JOIN] FAILED: either credentials/config are wrong, device state was invalid, or RF/network accept is missing");
+  DBG_PRINTLN("[JOIN] FAILED: either credentials/config are wrong, device state was invalid, or RF/network accept is missing");
   return false;
 }
 
@@ -825,32 +850,32 @@ static bool wait_for_send_result(uint32_t timeout_ms) {
   }
 
   if (!g_send_event_seen) {
-    Serial.println("[SEND] Timeout while waiting for send callback");
+    DBG_PRINTLN("[SEND] Timeout while waiting for send callback");
     return false;
   }
 
   if (g_last_send_status == RAK_LORAMAC_STATUS_OK) {
-    Serial.println("[SEND] Uplink finished successfully");
+    DBG_PRINTLN("[SEND] Uplink finished successfully");
     return true;
   }
 
-  Serial.printf("[SEND] Uplink failed with status %s\r\n",
-                loramac_status_name(g_last_send_status));
+  DBG_PRINTF("[SEND] Uplink failed with status %s\r\n",
+             loramac_status_name(g_last_send_status));
   return false;
 }
 
 static bool send_measurement_payload() {
   if (!g_bme_ready) {
-    Serial.println("[SENS] BME280 is not ready, skipping payload send");
+    DBG_PRINTLN("[SENS] BME280 is not ready, skipping payload send");
     return false;
   }
 
-  digitalWrite(PWR_ENABLE_PIN, HIGH);
+  sensor_power_on();
   delay(100);
 
   float temp_c = bme280_read_temperature();
   float humidity_pct = bme280_read_humidity();
-  float o2_raw = read_o2_percent_raw();
+  float o2_raw = read_o2_percent_raw_stabilized();
   float vbat = read_battery_voltage();
   uint8_t bat_pct = battery_percent(vbat);
 
@@ -860,127 +885,112 @@ static bool send_measurement_payload() {
   g_send_event_seen = false;
   g_last_send_status = INT32_MIN;
 
-  Serial.printf("[SEND] Requesting uplink on FPort %u (%s)\r\n",
-                LORA_FPORT, LORA_CONFIRMED_UPLINK ? "confirmed" : "unconfirmed");
+  DBG_PRINTF("[SEND] Requesting uplink on FPort %u (%s)\r\n",
+             LORA_FPORT, LORA_CONFIRMED_UPLINK ? "confirmed" : "unconfirmed");
 
   if (!api.lorawan.send(sizeof(payload),
                         (uint8_t *)&payload,
                         LORA_FPORT,
                         LORA_CONFIRMED_UPLINK,
                         LORA_SEND_RETRY)) {
-    Serial.println("[SEND] Start failed: stack did not accept the uplink request");
+    DBG_PRINTLN("[SEND] Start failed: stack did not accept the uplink request");
+    sensor_power_off();
     return false;
   }
 
-  return wait_for_send_result(15000UL);
+  bool ok = wait_for_send_result(15000UL);
+  sensor_power_off();
+  return ok;
 }
 
 // ================= SETUP =================
 void setup() {
-  pinMode(CAL_MODE_PIN, INPUT_PULLUP);
   pinMode(SERVICE_MODE_PIN, INPUT_PULLUP);
+  pinMode(PWR_ENABLE_PIN, OUTPUT);
+  sensor_power_off();
   uint32_t trigger_start = millis();
-  while ((millis() - trigger_start) < CAL_MODE_BOOT_WINDOW_MS) {
-    if (digitalRead(CAL_MODE_PIN) == LOW || digitalRead(SERVICE_MODE_PIN) == LOW) {
-      g_cal_mode = true;
+  while ((millis() - trigger_start) < DEBUG_BOOT_WINDOW_MS) {
+    if (digitalRead(SERVICE_MODE_PIN) == LOW) {
+      g_debug_mode = true;
       break;
     }
     delay(5);
   }
 
-  if (g_cal_mode) {
+  if (g_debug_mode) {
     Serial.begin(115200, RAK_AT_MODE);
     delay(1200);
   }
 
-  if (g_cal_mode) {
-    Serial.println();
-    Serial.println("========================================");
-    Serial.println("=== RAK3172 RUI O2 + BME280 SENSOR   ===");
-    Serial.println("=== VS Code / Join-first build       ===");
-    Serial.println("========================================");
-    Serial.println("[MODE] Calibration/debug mode enabled");
-    Serial.println("[MODE] Hold PA4 LOW at boot for service/debug mode");
-    Serial.println("[MODE] Keep PA4 LOW for 3s after boot to auto-start fresh-air calibration");
-    Serial.println("[MODE] Legacy trigger PA0 LOW at boot remains supported");
+  if (g_debug_mode) {
+    DBG_PRINTLN("");
+    DBG_PRINTLN("========================================");
+    DBG_PRINTLN("=== RAK3172 RUI O2 + BME280 SENSOR   ===");
+    DBG_PRINTLN("=== VS Code / Join-first build       ===");
+    DBG_PRINTLN("========================================");
+    DBG_PRINTLN("[MODE] Debug/calibration mode enabled");
+    DBG_PRINTLN("[MODE] Hold PA4 LOW at boot for service/debug mode");
     log_rui_versions();
-  }
 
-  pinMode(PWR_ENABLE_PIN, OUTPUT);
-  digitalWrite(PWR_ENABLE_PIN, HIGH);
-  Serial.println("[PWR] Sensor rail enabled on PA8");
+    sensor_power_on();
+    delay(100);
+    run_o2_calibration_from_boot_prompt();
+    sensor_power_off();
+  }
 
   Serial1.end();
   pinMode(PB6, INPUT);
   pinMode(PB7, INPUT);
-  Serial.println("[UART1] Serial1 disabled to free PB6/PB7 for I2C");
+  DBG_PRINTLN("[UART1] Serial1 disabled to free PB6/PB7 for I2C");
 
   analogReadResolution(10);
   pinMode(BAT_ADC_PIN, INPUT);
   pinMode(O2_ADC_PIN, INPUT);
-  Serial.println("[ADC] Battery on PB3, O2 on PB2");
+  DBG_PRINTLN("[ADC] Battery on PB3, O2 on PB2");
 
   pinMode(I2C_SDA_PIN, INPUT);
   pinMode(I2C_SCL_PIN, INPUT);
   Wire.begin();
-  Serial.println("[I2C] Wire ready on PB7/PB6");
+  DBG_PRINTLN("[I2C] Wire ready on PB7/PB6");
 
-  Serial.println("[BME] Initializing...");
+  sensor_power_on();
+  delay(100);
+  DBG_PRINTLN("[BME] Initializing...");
   g_bme_ready = bme280_init();
   if (g_bme_ready) {
     float t = bme280_read_temperature();
     float h = bme280_read_humidity();
-    Serial.printf("[BME] OK, test reading %.2f C / %.2f %%RH\r\n", t, h);
+    DBG_PRINTF("[BME] OK, test reading %.2f C / %.2f %%RH\r\n", t, h);
   } else {
-    Serial.println("[BME] FAILED - join diagnostics can still run");
+    DBG_PRINTLN("[BME] FAILED - join diagnostics can still run");
   }
 
   float vbat = read_battery_voltage();
-  float o2 = read_o2_percent_raw();
-  Serial.println("[SENS] Boot sanity check:");
-  Serial.printf("  Battery: %.3f V (%u%%)\r\n", vbat, battery_percent(vbat));
-  Serial.printf("  O2 raw:  %.2f %%\r\n", o2);
-  Serial.println("[CAL] Hold PA4 LOW for 3s after boot to auto-start 20.9% calibration");
-  Serial.println("[CAL] Or send 'c' in serial monitor to start interactive calibration");
+  float o2 = read_o2_percent_raw_stabilized();
+  DBG_PRINTLN("[SENS] Boot sanity check:");
+  DBG_PRINTF("  Battery: %.3f V (%u%%)\r\n", vbat, battery_percent(vbat));
+  DBG_PRINTF("  O2 raw:  %.2f %%\r\n", o2);
 
-  if (g_cal_mode && digitalRead(SERVICE_MODE_PIN) == LOW) {
-    Serial.println("[CAL] PA4 is LOW. Keep it LOW for 3s to auto-start calibration...");
-    if (wait_for_pin_low_continuous(SERVICE_MODE_PIN, CAL_MODE_AUTO_START_MS)) {
-      g_calibration_requested_at_boot = true;
-      Serial.println("[CAL] Auto-start calibration armed from PA4");
-    } else {
-      Serial.println("[CAL] Auto-start cancelled because PA4 was released");
-    }
+  if (g_debug_mode) {
+    DBG_PRINTLN("[CAL] PA4 debug mode active");
   }
+  sensor_power_off();
 
   if (!configure_lorawan()) {
-    Serial.println("[INIT] LoRaWAN configuration failed");
-    Serial.println("========================================");
+    DBG_PRINTLN("[INIT] LoRaWAN configuration failed");
+    DBG_PRINTLN("========================================");
     return;
   }
 
-  Serial.printf("[MODE] Join diagnostics only: %s\r\n", JOIN_DIAGNOSTICS_ONLY ? "YES" : "NO");
-  Serial.printf("[MODE] Low power sleep:       %s\r\n", ENABLE_LOW_POWER_SLEEP ? "YES" : "NO");
-  Serial.println("========================================");
+  DBG_PRINTF("[MODE] Join diagnostics only: %s\r\n", JOIN_DIAGNOSTICS_ONLY ? "YES" : "NO");
+  DBG_PRINTF("[MODE] Low power sleep:       %s\r\n", ENABLE_LOW_POWER_SLEEP ? "YES" : "NO");
+  DBG_PRINTLN("========================================");
 }
 
 // ================= LOOP =================
 void loop() {
   static uint32_t last_send_at = 0;
-
-  if (g_cal_mode && g_calibration_requested_at_boot) {
-    g_calibration_requested_at_boot = false;
-    run_o2_calibration(20.9f);
-  }
-
-  if (g_cal_mode) {
-    while (Serial.available() > 0) {
-      char cmd = (char)Serial.read();
-      if (cmd == 'c' || cmd == 'C') {
-        run_o2_calibration_interactive();
-      }
-    }
-  }
+  static uint32_t last_debug_o2_log_at = 0;
 
   if (!ensure_joined()) {
     delay(JOIN_RETRY_DELAY_MS);
@@ -988,22 +998,41 @@ void loop() {
   }
 
   if (JOIN_DIAGNOSTICS_ONLY) {
-    Serial.println("[JOIN] Diagnostics mode active, no sensor payload will be sent");
+    DBG_PRINTLN("[JOIN] Diagnostics mode active, no sensor payload will be sent");
     delay(5000);
     return;
   }
 
   uint32_t now = millis();
+  if (g_debug_mode && (last_debug_o2_log_at == 0 || (now - last_debug_o2_log_at) >= DEBUG_O2_LOG_INTERVAL_MS)) {
+    sensor_power_on();
+    delay(100);
+    float o2 = read_o2_percent_raw_stabilized();
+    sensor_power_off();
+    DBG_PRINTF("[DBG] O2 raw: %.2f %%\r\n", o2);
+    last_debug_o2_log_at = now;
+  }
+
   if (last_send_at == 0 || (now - last_send_at) >= SEND_INTERVAL_MS) {
     last_send_at = now;
-    Serial.printf("[SEND] Uptime %.1f min, starting payload cycle\r\n",
-                  millis() / 60000.0f);
+    DBG_PRINTF("[SEND] Uptime %.1f min, starting payload cycle\r\n",
+               millis() / 60000.0f);
     send_measurement_payload();
-    Serial.println("----------------------------------------");
+    DBG_PRINTLN("----------------------------------------");
   }
 
   if (ENABLE_LOW_POWER_SLEEP) {
-    api.system.sleep.all(1000);
+    uint32_t sleep_ms = 1000UL;
+    if (!g_debug_mode && last_send_at != 0) {
+      uint32_t elapsed = millis() - last_send_at;
+      if (elapsed < SEND_INTERVAL_MS) {
+        sleep_ms = SEND_INTERVAL_MS - elapsed;
+      }
+      if (sleep_ms > 60000UL) {
+        sleep_ms = 60000UL;
+      }
+    }
+    api.system.sleep.all(sleep_ms);
   } else {
     delay(1000);
   }
