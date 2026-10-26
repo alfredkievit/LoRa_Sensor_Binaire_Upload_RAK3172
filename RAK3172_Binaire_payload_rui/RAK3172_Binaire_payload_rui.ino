@@ -1,9 +1,29 @@
 /*
-  RAK3172 RUI3/RUI4 - O2 + BME280 sensor
-  VS Code / Arduino workflow, join-first diagnostics
+  RAK3172 RUI3/RUI4 - O2 (Alphasense O2-A2) + BME280 + LoRaWAN
+  Functioneel gelijk aan de MKR1310-firmware (LoRa_Sensor_Binaire_Upload).
 
-  Target board package detected locally:
-    rak_rui stm32 4.2.4
+  Target board package: rak_rui stm32 4.2.4
+
+  2 MODES (ALLEEN bepaald door PA4 / D1 / J3 pin 4 bij boot):
+
+  1) DEBUG + KALIBRATIE mode  (PA4 LOW binnen 2s na boot)
+     - Serial prints ON (115200)
+     - Direct kalibratie:
+         * standaard kalibratiegas = 20.9% als je niets invoert
+         * ander gas: voer O2% in via Serial binnen timeout en druk Enter
+         * warm-up (>= 2 min) + stabiliteitscheck voordat er iets wordt opgeslagen
+     - Slaat O2-referentie + kalibratietemperatuur op in user flash
+     - Na kalibratie: GEEN join/uplink; elke 30s payload-preview + actuele waarden
+
+  2) PRODUCTIE mode (PA4 NIET LOW bij boot)
+     - Geen Serial prints
+     - Join + uplink, daarna RUI sleep met batterij-afhankelijk interval:
+         * <10%   => "helemaal uit": ~2 maanden slapen, geen uplink meer
+         * 10-14% => ~6 uur
+         * 15-19% => ~4 uur
+         * >=20%  => ~15 min
+
+  Hardware: print v4, JP2 dicht (TPL5110 overbrugd), TPL5110 DONE (PA8) blijft LOW.
 */
 
 #include <Arduino.h>
@@ -14,7 +34,6 @@
 #include "arduino_secrets.h"
 
 // ================= CONFIG =================
-constexpr uint32_t SEND_INTERVAL_MS          = 15UL * 60UL * 1000UL;
 constexpr uint32_t JOIN_ATTEMPT_TIMEOUT_MS   = 90UL * 1000UL;
 constexpr uint32_t JOIN_RETRY_DELAY_MS       = 5UL * 1000UL;
 constexpr uint32_t JOIN_POLL_INTERVAL_MS     = 2UL * 1000UL;
@@ -22,23 +41,21 @@ constexpr uint8_t  JOIN_MAX_ATTEMPTS         = 3;
 constexpr uint8_t  LORA_FPORT                = 1;
 constexpr bool     LORA_CONFIRMED_UPLINK     = false;
 constexpr uint8_t  LORA_SEND_RETRY           = 1;
-constexpr bool     JOIN_DIAGNOSTICS_ONLY     = false;
-constexpr bool     ENABLE_LOW_POWER_SLEEP    = !JOIN_DIAGNOSTICS_ONLY;
-constexpr uint32_t CAL_GAS_INPUT_TIMEOUT_MS  = 5000UL;
+constexpr uint32_t SEND_RESULT_TIMEOUT_MS    = 15UL * 1000UL;
 constexpr uint32_t DEBUG_BOOT_WINDOW_MS      = 2000UL;
-constexpr uint32_t DEBUG_O2_LOG_INTERVAL_MS  = 30000UL;
-constexpr uint8_t  O2_STABILIZED_SAMPLES     = 20;
-constexpr uint32_t O2_STABILIZED_DELAY_MS    = 50UL;
-constexpr bool     RECOVER_RAK_DEV_EUI       = false;
-// DevEUI now comes from chip unique ID, no factory override
+constexpr uint32_t DEBUG_PAYLOAD_PREVIEW_MS  = 30UL * 1000UL;
+constexpr uint32_t CAL_GAS_INPUT_TIMEOUT_MS  = 10UL * 1000UL;
+// Vergeten J3-brug: na deze tijd gaat de node zelf naar productie (join + uplinks)
+constexpr uint32_t DEBUG_MODE_MAX_MS         = 30UL * 60UL * 1000UL;
 
-// ================= PINMAP =================
-#define I2C_SDA_PIN         PB7
-#define I2C_SCL_PIN         PB6
-#define BAT_ADC_PIN         PB3
-#define O2_ADC_PIN          PB2
-#define PWR_ENABLE_PIN      PA8
-#define SERVICE_MODE_PIN    PA4
+// ================= PINMAP (schema v4) =================
+// I2C: Wire default PA11 (SDA) / PA12 (SCL)
+#define BAT_ADC_PIN         PB3   // A0, VBAT divider 470k/1.5M
+#define O2_ADC_PIN          PB4   // A1, OPA333 output
+#define TPL_DONE_PIN        PA8   // TPL5110 DONE: HIGH = cut VBAT. Keep LOW (JP2 bridged, RUI sleep)
+#define SERVICE_MODE_PIN    PA4   // D1 / J3 pin 4, LOW at boot = debug + calibration mode
+#define I2C_SDA_PIN         PA11  // only used for bus recovery; Wire uses these by default
+#define I2C_SCL_PIN         PA12
 
 // ================= BME280 ADRESSEN =================
 #define BME280_ADDR          0x77
@@ -51,13 +68,61 @@ constexpr bool     RECOVER_RAK_DEV_EUI       = false;
 #define BME280_REG_HUM       0xFD
 
 // ================= BATTERY =================
-constexpr float R_TOP = 470000.0f;
-constexpr float R_BOT = 1500000.0f;
-constexpr float VREF  = 3.3f;
+constexpr float   R_TOP = 470000.0f;
+constexpr float   R_BOT = 1500000.0f;
+constexpr float   VREF  = 3.3f;
+constexpr uint8_t BAT_CUTOFF_PCT = 10;   // onder 10%: helemaal uit
+
+// ================= BME280 PLAUSIBILITY / PAYLOAD MARKERS =================
+// Identiek aan MKR1310 fix/o2-low-readings
+constexpr float    BME_TEMP_MIN_VALID       = -40.0f;
+constexpr float    BME_TEMP_MAX_VALID       = 85.0f;
+constexpr float    BME_RH_MIN_VALID         = 0.0f;
+constexpr float    BME_RH_MAX_VALID         = 100.0f;
+constexpr int16_t  T_PAYLOAD_INVALID_MARKER = 0x7FFF;
+constexpr uint16_t H_PAYLOAD_INVALID_MARKER = 0xFFFF;
+
+// Sleep intervals (RUI sleep.all, in chunks zodat uint32 ms niet overloopt)
+constexpr uint32_t SLEEP_15MIN_MS   = 15UL * 60UL * 1000UL;
+constexpr uint32_t SLEEP_4H_MS      = 4UL * 60UL * 60UL * 1000UL;
+constexpr uint32_t SLEEP_6H_MS      = 6UL * 60UL * 60UL * 1000UL;
+constexpr uint32_t SLEEP_DAY_MS     = 24UL * 60UL * 60UL * 1000UL;
+constexpr uint32_t SLEEP_CHUNK_MS   = 60UL * 1000UL;
+constexpr uint16_t CUTOFF_DAYS      = 60;
 
 // ================= O2 =================
-constexpr float O2_VREF = 3.1714f;
-constexpr float O2_VOLTAGE_AT_20_9_PCT = 1.04f;
+// ADC-spanning: counts * O2_ADC_VREF / 1023. O2% = V * 20.9 / V_ref(20.9%).
+constexpr float    O2_ADC_VREF                    = 3.1714f;
+constexpr float    O2_SENSOR_FULL_SCALE_COUNTS    = 1023.0f;
+constexpr float    O2_CAL_V_DEFAULT               = 2.207f;  // fallback: spanning bij 20.9% O2 (gemeten 2026-10-26, PB4)
+constexpr float    O2_CAL_V_MIN_VALID             = 0.30f;
+constexpr float    O2_CAL_V_MAX_VALID             = 2.50f;
+constexpr uint32_t O2_ADC_SAMPLE_DELAY_MS         = 1;
+constexpr uint8_t  O2_STABILIZED_SAMPLES          = 20;
+constexpr uint32_t O2_STABILIZED_DELAY_MS         = 50;
+constexpr uint8_t  O2_DEBUG_STABILIZED_READS      = 3;
+constexpr uint8_t  O2_PRODUCTION_ADC_SAMPLES      = 8;
+constexpr uint32_t O2_PRODUCTION_ADC_SAMPLE_DELAY_MS = 0;
+constexpr float    O2_PERCENT_MIN_VALID           = 0.0f;
+constexpr float    O2_PERCENT_MAX_VALID           = 25.0f;
+constexpr float    O2_PERCENT_AIR_DISPLAY_CAP     = 20.0f;
+constexpr float    O2_PERCENT_CAL_INPUT_MAX       = 30.0f;
+constexpr float    O2_DEFAULT_CAL_GAS             = 20.9f;
+constexpr uint16_t O2_PAYLOAD_INVALID_MARKER      = 65535;
+// Geen ondergrens voor metingen: 0 V is een geldige 0% O2 (CA-opslag meet 0.5-3% O2).
+// Een losse cel is niet te onderscheiden van 0%, want R15 trekt de opamp-ingang naar GND.
+// Onder O2_ADC_LOW_CHECK wel een open-circuit test: zwevende PB4 (opamp-uitgang los) = defect.
+constexpr float    O2_ADC_MAX_VALID               = 970.0f;  // verzadiging
+constexpr float    O2_ADC_LOW_CHECK               = 50.0f;
+constexpr uint32_t O2_OPEN_CIRCUIT_SETTLE_MS      = 10;
+// Kalibratie heeft wel een bruikbaar signaal nodig (~1.5% O2 bij huidige versterking)
+constexpr float    O2_CAL_ADC_MIN_VALID           = 50.0f;
+constexpr float    O2_CAL_STABILITY_DELTA_MAX     = 5.0f;
+constexpr uint8_t  O2_CAL_STABILITY_POINTS        = 6;
+constexpr uint32_t O2_CAL_SAMPLE_INTERVAL_MS      = 10UL * 1000UL;
+constexpr uint32_t O2_CAL_MIN_WARMUP_MS           = 120UL * 1000UL;
+constexpr uint32_t O2_CAL_MAX_WARMUP_MS           = 600UL * 1000UL;
+constexpr float    O2_CAL_DEFAULT_TEMP_C          = 20.0f;   // aangenomen temp voor default referentie
 
 // ================= STM32 UID =================
 #define UID64_BASE_ADDR 0x1FFF7580
@@ -78,24 +143,57 @@ struct {
 
 // ================= PAYLOAD =================
 struct __attribute__((packed)) PayloadV1 {
-  uint8_t  msgType;
-  uint16_t o2_x10;
-  int16_t  t_x10;
-  uint16_t h_x10;
-  uint8_t  bat_pct;
+  uint8_t  msgType;   // = 0x01
+  uint16_t o2_x10;    // O2% * 10, 65535 = invalid O2 measurement
+  int16_t  t_x10;     // degC * 10
+  uint16_t h_x10;     // RH% * 10
+  uint8_t  bat_pct;   // 0..100
 };
 
 static_assert(sizeof(PayloadV1) == 8, "PayloadV1 must remain 8 bytes");
 
+struct O2Reading {
+  float   o2;
+  float   adc;
+  float   adc_min;
+  float   adc_max;
+  bool    valid;
+  uint8_t status;
+  bool    open_circuit_tested;
+  bool    open_circuit;
+};
+
+enum O2Status : uint8_t {
+  O2_STATUS_OK = 0,
+  O2_STATUS_ADC_TOO_LOW = 1,      // only for a non-finite ADC average; low counts are valid
+  O2_STATUS_ADC_TOO_HIGH = 2,
+  O2_STATUS_O2_OUT_OF_RANGE = 3,
+  O2_STATUS_NO_VALID_CALIBRATION = 4,
+  O2_STATUS_SENSOR_DISCONNECTED = 5
+};
+
+// ================= FLASH CALIBRATION =================
+struct CalData {
+  uint32_t magic;
+  float    o2_cal_v;
+  float    cal_temp;
+  uint32_t checksum;
+};
+
+constexpr uint32_t CAL_MAGIC        = 0x4F324341; // 'O2CA'
+constexpr uint32_t CAL_FLASH_OFFSET = 0;          // RUI user flash partition
+
 // ================= RUNTIME STATE =================
 static bool     g_bme_ready = false;
 static bool     g_debug_mode = false;
+static bool     g_lora_ready = false;
 static bool     g_join_announced = false;
 static volatile bool    g_join_event_seen = false;
 static volatile int32_t g_last_join_status = INT32_MIN;
 static volatile bool    g_send_event_seen = false;
 static volatile int32_t g_last_send_status = INT32_MIN;
-static float    g_o2_calibration_vref = O2_VOLTAGE_AT_20_9_PCT;
+static float    g_o2_cal_v = O2_CAL_V_DEFAULT;
+static float    g_o2_cal_temp = O2_CAL_DEFAULT_TEMP_C;
 
 #define DBG_PRINT(x) do { if (g_debug_mode) { Serial.print(x); } } while (0)
 #define DBG_PRINTLN(x) do { if (g_debug_mode) { Serial.println(x); } } while (0)
@@ -158,6 +256,18 @@ static const char *class_name(uint8_t klass) {
   }
 }
 
+static const char *o2_status_name(uint8_t status) {
+  switch (status) {
+    case O2_STATUS_OK:                   return "OK";
+    case O2_STATUS_ADC_TOO_LOW:          return "ADC_TOO_LOW";
+    case O2_STATUS_ADC_TOO_HIGH:         return "ADC_TOO_HIGH";
+    case O2_STATUS_O2_OUT_OF_RANGE:      return "O2_OUT_OF_RANGE";
+    case O2_STATUS_NO_VALID_CALIBRATION: return "NO_VALID_CALIBRATION";
+    case O2_STATUS_SENSOR_DISCONNECTED:  return "SENSOR_DISCONNECTED";
+    default:                             return "UNKNOWN";
+  }
+}
+
 static void read_hardware_uid64(uint8_t uid[8]) {
   const uint32_t *uid64_ptr = (const uint32_t *)UID64_BASE_ADDR;
   uint32_t word0 = uid64_ptr[0];
@@ -176,13 +286,6 @@ static void read_hardware_uid64(uint8_t uid[8]) {
 static bool eui_is_all_zero(const uint8_t *data, size_t len) {
   for (size_t i = 0; i < len; i++) {
     if (data[i] != 0U) return false;
-  }
-  return true;
-}
-
-static bool bytes_equal(const uint8_t *lhs, const uint8_t *rhs, size_t len) {
-  for (size_t i = 0; i < len; i++) {
-    if (lhs[i] != rhs[i]) return false;
   }
   return true;
 }
@@ -207,14 +310,6 @@ static void print_hex_compact(const uint8_t *data, size_t len) {
   for (size_t i = 0; i < len; i++) {
     DBG_PRINTF("%02X", data[i]);
   }
-}
-
-static void sensor_power_on() {
-  digitalWrite(PWR_ENABLE_PIN, HIGH);
-}
-
-static void sensor_power_off() {
-  digitalWrite(PWR_ENABLE_PIN, LOW);
 }
 
 static int hex_nibble(char c) {
@@ -346,37 +441,30 @@ static void log_lorawan_runtime_config() {
   DBG_PRINTF("  Joined:    %s\r\n", api.lorawan.njs.get() ? "YES" : "NO");
 }
 
-static bool allow_failed_set_if_value_matches(const char *label,
-                                              bool set_ok,
-                                              uint32_t current_value,
-                                              uint32_t expected_value) {
-  if (set_ok) return true;
-  if (current_value == expected_value) {
-    DBG_PRINTF("[LoRa] %s already matches desired value, continuing\r\n", label);
-    return true;
+// ================= SLEEP =================
+// RUI sleep in chunks: houdt elke sleep.all() call kort en voorkomt uint32-overloop.
+static void sleep_for_ms(uint32_t total_ms) {
+  while (total_ms > 0) {
+    uint32_t chunk = (total_ms > SLEEP_CHUNK_MS) ? SLEEP_CHUNK_MS : total_ms;
+    api.system.sleep.all(chunk);
+    total_ms -= chunk;
   }
-
-  DBG_PRINTF("[LoRa] ERROR: failed to set %s (current=%lu expected=%lu)\r\n",
-             label,
-             (unsigned long)current_value,
-             (unsigned long)expected_value);
-  return false;
 }
 
-static bool allow_failed_set_if_bytes_match(const char *label,
-                                            bool set_ok,
-                                            bool get_ok,
-                                            const uint8_t *current_value,
-                                            const uint8_t *expected_value,
-                                            size_t len) {
-  if (set_ok) return true;
-  if (get_ok && bytes_equal(current_value, expected_value, len)) {
-    DBG_PRINTF("[LoRa] %s already matches desired value, continuing\r\n", label);
-    return true;
-  }
+static uint32_t sleep_ms_for_battery_pct(uint8_t bat_pct) {
+  if (bat_pct < 15) return SLEEP_6H_MS;
+  if (bat_pct < 20) return SLEEP_4H_MS;
+  return SLEEP_15MIN_MS;
+}
 
-  DBG_PRINTF("[LoRa] ERROR: failed to set %s and readback does not match\r\n", label);
-  return false;
+// <10%: "helemaal uit" => ~2 maanden slapen, daarna blijven slapen tot reset
+static void battery_cutoff_two_months() {
+  for (uint16_t day = 0; day < CUTOFF_DAYS; day++) {
+    sleep_for_ms(SLEEP_DAY_MS);
+  }
+  while (true) {
+    sleep_for_ms(SLEEP_DAY_MS);
+  }
 }
 
 // ================= BME280 FUNCTIES =================
@@ -421,6 +509,32 @@ static void bme280_read_coefficients() {
   bme_cal.dig_H4 = (int16_t)((e4 << 4) | (e5 & 0x0F));
   bme_cal.dig_H5 = (int16_t)((e6 << 4) | (e5 >> 4));
   bme_cal.dig_H6 = (int8_t)Wire.read();
+}
+
+// An MCU reset does not clock the I2C bus: if the BME280 holds SDA low it keeps
+// doing so after the reset. Clock it free and send a STOP before using the bus.
+static void i2c_bus_recover() {
+  Wire.end();
+
+  pinMode(I2C_SCL_PIN, OUTPUT);
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+
+  // Max 9 pulses: a slave can never hold more than 9 bits (8 data + ACK).
+  for (uint8_t i = 0; i < 9 && digitalRead(I2C_SDA_PIN) == LOW; i++) {
+    digitalWrite(I2C_SCL_PIN, LOW);
+    delayMicroseconds(5);
+    digitalWrite(I2C_SCL_PIN, HIGH);
+    delayMicroseconds(5);
+  }
+
+  // Manual STOP condition: SDA low, SCL high, then SDA high.
+  pinMode(I2C_SDA_PIN, OUTPUT);
+  digitalWrite(I2C_SDA_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(I2C_SCL_PIN, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(I2C_SDA_PIN, HIGH);
+  delayMicroseconds(5);
 }
 
 static bool bme280_init() {
@@ -488,7 +602,24 @@ static float bme280_read_humidity() {
   return humidity / 1024.0f;
 }
 
-// ================= SENSOR FUNCTIES =================
+// Reads T/RH; returns false (and NaN values) if the BME280 is absent or implausible.
+static bool bme280_read(float &temp_c, float &humidity_pct) {
+  temp_c = NAN;
+  humidity_pct = NAN;
+  if (!g_bme_ready) return false;
+
+  const float t = bme280_read_temperature();
+  const float h = bme280_read_humidity();
+  if (!isfinite(t) || t < BME_TEMP_MIN_VALID || t > BME_TEMP_MAX_VALID ||
+      !isfinite(h) || h < BME_RH_MIN_VALID   || h > BME_RH_MAX_VALID) {
+    return false;
+  }
+  temp_c = t;
+  humidity_pct = h;
+  return true;
+}
+
+// ================= BATTERY =================
 static float read_battery_voltage() {
   uint32_t adc = 0;
   for (int i = 0; i < 8; i++) {
@@ -506,43 +637,305 @@ static uint8_t battery_percent(float vbat) {
   return (uint8_t)constrain(pct, 0, 100);
 }
 
-static float read_o2_voltage() {
-  uint32_t adc = 0;
-  for (int i = 0; i < 32; i++) {
-    adc += analogRead(O2_ADC_PIN);
-    delay(1);
-  }
-  adc /= 32;
+// ================= O2 TEMPERATUURCOMPENSATIE =================
+// Alphasense O2-A2 datasheet, Fig.1 "Output Temperature Dependence":
+// % output relative to the 20degC reference point, vs temperature (degC).
+// Identiek aan de MKR1310-firmware.
+struct O2TempCompPoint { float temp_c; float rel_output_pct; };
+constexpr O2TempCompPoint O2_TEMP_COMP_TABLE[] = {
+  { -20.0f,  89.0f },
+  { -10.0f,  93.0f },
+  {   0.0f,  96.0f },
+  {  10.0f,  98.0f },
+  {  20.0f, 100.0f },
+  {  30.0f, 102.0f },
+  {  40.0f, 103.5f },
+  {  50.0f, 104.0f },
+};
+constexpr uint8_t O2_TEMP_COMP_POINTS = sizeof(O2_TEMP_COMP_TABLE) / sizeof(O2_TEMP_COMP_TABLE[0]);
 
-  return (adc * O2_VREF) / 1023.0f;
+// Linear interpolation over the table, clamped at the table edges.
+static float o2_relative_output_pct(float temp_c) {
+  if (temp_c <= O2_TEMP_COMP_TABLE[0].temp_c) return O2_TEMP_COMP_TABLE[0].rel_output_pct;
+
+  constexpr uint8_t last = O2_TEMP_COMP_POINTS - 1;
+  if (temp_c >= O2_TEMP_COMP_TABLE[last].temp_c) return O2_TEMP_COMP_TABLE[last].rel_output_pct;
+
+  for (uint8_t i = 0; i < last; i++) {
+    const float t0 = O2_TEMP_COMP_TABLE[i].temp_c;
+    const float t1 = O2_TEMP_COMP_TABLE[i + 1].temp_c;
+    if (temp_c >= t0 && temp_c <= t1) {
+      const float r0 = O2_TEMP_COMP_TABLE[i].rel_output_pct;
+      const float r1 = O2_TEMP_COMP_TABLE[i + 1].rel_output_pct;
+      const float frac = (temp_c - t0) / (t1 - t0);
+      return r0 + frac * (r1 - r0);
+    }
+  }
+  return 100.0f; // unreachable
 }
 
-static float read_o2_percent_raw() {
-  // ME2-O2-20 + OPA333: Vout ~1.0V at 20.9% O2.
-  // Formula: O2% = Vout * (20.9 / Vout_at_20.9%)
-  // Measured ~1.04V at 20.9%, use that as calibration reference.
-  float ref = g_o2_calibration_vref;
-  if (ref < 0.05f) {
-    ref = O2_VOLTAGE_AT_20_9_PCT;
-  }
-  return read_o2_voltage() * (20.9f / ref);
+// Rescales a raw O2 reading (taken at ambient_c, using a reference calibrated at cal_c)
+// back to what the sensor would read at the calibration temperature.
+static float apply_o2_temp_compensation(float o2_raw, float ambient_c, float cal_c) {
+  if (!isfinite(ambient_c) || !isfinite(cal_c)) return o2_raw;
+  const float rel_now = o2_relative_output_pct(ambient_c);
+  const float rel_cal = o2_relative_output_pct(cal_c);
+  if (rel_now <= 0.0f) return o2_raw;
+  return o2_raw * (rel_cal / rel_now);
 }
 
-static float read_o2_voltage_stabilized() {
-  float sum_v = 0.0f;
+// ================= O2 CALIBRATIE IN FLASH =================
+static uint32_t cal_checksum(const CalData &d) {
+  const uint8_t *p = reinterpret_cast<const uint8_t *>(&d);
+  uint32_t sum = 0;
+  for (size_t i = 0; i < sizeof(CalData) - sizeof(uint32_t); i++) sum += p[i];
+  return sum;
+}
+
+static bool is_valid_o2_cal_v(float v) {
+  return isfinite(v) && v >= O2_CAL_V_MIN_VALID && v <= O2_CAL_V_MAX_VALID;
+}
+
+static bool is_valid_o2_cal_adc(float adc_counts) {
+  return isfinite(adc_counts) && adc_counts >= O2_CAL_ADC_MIN_VALID && adc_counts <= O2_ADC_MAX_VALID;
+}
+
+static bool load_calibration(float &out_cal_v, float &out_cal_temp) {
+  CalData d = {};
+  if (!api.system.flash.get(CAL_FLASH_OFFSET, reinterpret_cast<uint8_t *>(&d), sizeof(d))) return false;
+  if (d.magic != CAL_MAGIC) return false;
+  if (cal_checksum(d) != d.checksum) return false;
+  if (!is_valid_o2_cal_v(d.o2_cal_v)) return false;
+  out_cal_v    = d.o2_cal_v;
+  out_cal_temp = isfinite(d.cal_temp) ? d.cal_temp : O2_CAL_DEFAULT_TEMP_C;
+  return true;
+}
+
+static bool save_calibration(float cal_v, float cal_temp_c) {
+  if (!is_valid_o2_cal_v(cal_v)) {
+    DBG_PRINTF("[CAL] Refusing to save invalid O2 reference: %.5f V\r\n", cal_v);
+    return false;
+  }
+
+  CalData d = {};
+  d.magic    = CAL_MAGIC;
+  d.o2_cal_v = cal_v;
+  d.cal_temp = cal_temp_c;
+  d.checksum = cal_checksum(d);
+
+  if (!api.system.flash.set(CAL_FLASH_OFFSET, reinterpret_cast<uint8_t *>(&d), sizeof(d))) {
+    DBG_PRINTLN("[CAL] ERROR: flash write failed");
+    return false;
+  }
+
+  DBG_PRINTF("[CAL] Saved O2 reference to flash: %.5f V @ %.2f degC\r\n", cal_v, cal_temp_c);
+  return true;
+}
+
+// ================= O2 METING =================
+static float o2_percent_from_adc_counts(float adc_counts, float cal_v) {
+  const float v = adc_counts * (O2_ADC_VREF / O2_SENSOR_FULL_SCALE_COUNTS);
+  return v * (O2_DEFAULT_CAL_GAS / cal_v);
+}
+
+static float read_o2_adc_avg_counts() {
+  uint32_t sum = 0;
+  constexpr int NUM_SAMPLES = 32;
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    sum += analogRead(O2_ADC_PIN);
+    delay(O2_ADC_SAMPLE_DELAY_MS);
+  }
+  return (float)sum / (float)NUM_SAMPLES;
+}
+
+static float read_o2_adc_avg_counts_fast(uint8_t sample_count, uint32_t sample_delay_ms) {
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < sample_count; i++) {
+    sum += analogRead(O2_ADC_PIN);
+    if (sample_delay_ms > 0) delay(sample_delay_ms);
+  }
+  return (float)sum / (float)sample_count;
+}
+
+static float read_o2_adc_avg_counts_stabilized() {
+  float sum = 0.0f;
   for (uint8_t i = 0; i < O2_STABILIZED_SAMPLES; i++) {
-    sum_v += read_o2_voltage();
+    sum += read_o2_adc_avg_counts();
     delay(O2_STABILIZED_DELAY_MS);
   }
-  return sum_v / (float)O2_STABILIZED_SAMPLES;
+  return sum / (float)O2_STABILIZED_SAMPLES;
 }
 
-static float read_o2_percent_raw_stabilized() {
-  float ref = g_o2_calibration_vref;
-  if (ref < 0.05f) {
-    ref = O2_VOLTAGE_AT_20_9_PCT;
+// A galvanic O2-A2 cell outputs ~0 at 0% O2, exactly like an unplugged cell, so a
+// low ADC value alone cannot tell them apart. With the internal pull-up enabled the
+// driven OPA333 output keeps PB4 LOW, while a floating input is pulled HIGH. Only
+// meaningful for low readings: at normal air the output (~2.2 V) reads HIGH anyway.
+static bool is_o2_input_floating() {
+  pinMode(O2_ADC_PIN, INPUT_PULLUP);
+  delay(O2_OPEN_CIRCUIT_SETTLE_MS);
+  const bool floating = digitalRead(O2_ADC_PIN) == HIGH;
+  pinMode(O2_ADC_PIN, INPUT);
+  return floating;
+}
+
+// Shared validation for debug and production readings. Low O2 (down to 0%) is a
+// valid measurement; 65535 is only sent for a real sensor fault.
+static O2Reading finish_o2_reading(float adc_avg, float adc_min, float adc_max, float ambient_c) {
+  O2Reading reading = {NAN, adc_avg, adc_min, adc_max, false, O2_STATUS_NO_VALID_CALIBRATION, false, false};
+
+  if (!is_valid_o2_cal_v(g_o2_cal_v)) return reading;
+
+  if (!isfinite(adc_avg)) {
+    reading.status = O2_STATUS_ADC_TOO_LOW;
+    return reading;
   }
-  return read_o2_voltage_stabilized() * (20.9f / ref);
+  if (adc_avg > O2_ADC_MAX_VALID) {
+    reading.status = O2_STATUS_ADC_TOO_HIGH;
+    return reading;
+  }
+  if (adc_avg < O2_ADC_LOW_CHECK) {
+    reading.open_circuit_tested = true;
+    reading.open_circuit = is_o2_input_floating();
+    if (reading.open_circuit) {
+      reading.status = O2_STATUS_SENSOR_DISCONNECTED;
+      return reading;
+    }
+  }
+
+  const float o2_raw = o2_percent_from_adc_counts(adc_avg, g_o2_cal_v);
+  const float o2 = apply_o2_temp_compensation(o2_raw, ambient_c, g_o2_cal_temp);
+  reading.o2 = o2;
+
+  if (!isfinite(o2) || o2 < O2_PERCENT_MIN_VALID || o2 > O2_PERCENT_MAX_VALID) {
+    reading.status = O2_STATUS_O2_OUT_OF_RANGE;
+    return reading;
+  }
+
+  reading.valid = true;
+  reading.status = O2_STATUS_OK;
+  return reading;
+}
+
+static O2Reading read_o2_percent_validated(float ambient_c) {
+  float adc_min = 0.0f;
+  float adc_max = 0.0f;
+  float adc_sum = 0.0f;
+  for (uint8_t i = 0; i < O2_DEBUG_STABILIZED_READS; i++) {
+    const float adc = read_o2_adc_avg_counts_stabilized();
+    if (i == 0 || adc < adc_min) adc_min = adc;
+    if (i == 0 || adc > adc_max) adc_max = adc;
+    adc_sum += adc;
+  }
+  return finish_o2_reading(adc_sum / (float)O2_DEBUG_STABILIZED_READS, adc_min, adc_max, ambient_c);
+}
+
+static O2Reading read_o2_percent_production_validated(float ambient_c) {
+  const float adc = read_o2_adc_avg_counts_fast(O2_PRODUCTION_ADC_SAMPLES,
+                                                O2_PRODUCTION_ADC_SAMPLE_DELAY_MS);
+  return finish_o2_reading(adc, adc, adc, ambient_c);
+}
+
+// ================= O2 KALIBRATIE (debug mode) =================
+static bool try_compute_stable_calibration_adc(float &adc_avg_out, float &win_min_out, float &win_max_out) {
+  float window[O2_CAL_STABILITY_POINTS] = {0.0f};
+  uint8_t samples_collected = 0;
+  const uint32_t start_ms = millis();
+
+  DBG_PRINTLN("[CAL] Warm-up started");
+  DBG_PRINTF("[CAL] Need >= %lus warm-up and a stable ADC window.\r\n",
+             (unsigned long)(O2_CAL_MIN_WARMUP_MS / 1000UL));
+
+  while (millis() - start_ms <= O2_CAL_MAX_WARMUP_MS) {
+    const float adc_avg = read_o2_adc_avg_counts_stabilized();
+    window[samples_collected % O2_CAL_STABILITY_POINTS] = adc_avg;
+    samples_collected++;
+
+    DBG_PRINTF("[CAL] t=%lus ADC=%.1f\r\n", (unsigned long)((millis() - start_ms) / 1000UL), adc_avg);
+
+    if (samples_collected >= O2_CAL_STABILITY_POINTS) {
+      float win_min = window[0];
+      float win_max = window[0];
+      float sum = 0.0f;
+      for (uint8_t i = 0; i < O2_CAL_STABILITY_POINTS; i++) {
+        const float value = window[i];
+        if (value < win_min) win_min = value;
+        if (value > win_max) win_max = value;
+        sum += value;
+      }
+
+      const float delta = win_max - win_min;
+      DBG_PRINTF("[CAL] Stability window: min=%.1f max=%.1f delta=%.1f\r\n", win_min, win_max, delta);
+
+      if (millis() - start_ms < O2_CAL_MIN_WARMUP_MS) {
+        DBG_PRINTLN("[CAL] Warm-up time not reached yet.");
+      } else if (!is_valid_o2_cal_adc(adc_avg)) {
+        DBG_PRINTLN(adc_avg < O2_CAL_ADC_MIN_VALID
+                      ? "[CAL] ADC too low -> calibration blocked."
+                      : "[CAL] ADC too high / near saturation -> calibration blocked.");
+      } else if (delta > O2_CAL_STABILITY_DELTA_MAX) {
+        DBG_PRINTLN("[CAL] ADC window not stable yet.");
+      } else {
+        adc_avg_out = sum / (float)O2_CAL_STABILITY_POINTS;
+        win_min_out = win_min;
+        win_max_out = win_max;
+        DBG_PRINTLN("[CAL] ADC stable, starting calibration");
+        return true;
+      }
+    }
+
+    if (millis() - start_ms + O2_CAL_SAMPLE_INTERVAL_MS > O2_CAL_MAX_WARMUP_MS) break;
+    delay(O2_CAL_SAMPLE_INTERVAL_MS);
+  }
+
+  DBG_PRINTLN("[CAL] Sensor not stable after timeout -> not saved");
+  return false;
+}
+
+static void run_o2_auto_calibration(float cal_gas_o2) {
+  float adc_avg = 0.0f;
+  float win_min = 0.0f;
+  float win_max = 0.0f;
+  if (!try_compute_stable_calibration_adc(adc_avg, win_min, win_max)) return;
+
+  if (!is_valid_o2_cal_adc(adc_avg)) {
+    DBG_PRINTLN("[CAL] ADC outside valid range -> not saved");
+    return;
+  }
+
+  // Spanning bij kalibratiegas, teruggerekend naar de spanning bij 20.9% O2
+  const float avg_v = adc_avg * (O2_ADC_VREF / O2_SENSOR_FULL_SCALE_COUNTS);
+  const float new_cal_v = avg_v * (O2_DEFAULT_CAL_GAS / cal_gas_o2);
+
+  DBG_PRINTLN("");
+  DBG_PRINTLN("=== O2 AUTO CAL ===");
+  DBG_PRINTF("[CAL] Gas O2%%: %.2f\r\n", cal_gas_o2);
+  DBG_PRINTF("[CAL] ADC avg: %.1f (%.4f V)\r\n", adc_avg, avg_v);
+  DBG_PRINTF("[CAL] Stability min/max: %.1f / %.1f\r\n", win_min, win_max);
+  DBG_PRINTF("[CAL] New O2 reference: %.5f V @ 20.9%%\r\n", new_cal_v);
+
+  if (!is_valid_o2_cal_v(new_cal_v)) {
+    DBG_PRINTF("[CAL] New O2 reference outside valid range [%.2f, %.2f] -> not saved\r\n",
+               O2_CAL_V_MIN_VALID, O2_CAL_V_MAX_VALID);
+    return;
+  }
+
+  float cal_temp_c = NAN;
+  float cal_rh = NAN;
+  (void)bme280_read(cal_temp_c, cal_rh);
+
+  g_o2_cal_v    = new_cal_v;
+  g_o2_cal_temp = isfinite(cal_temp_c) ? cal_temp_c : O2_CAL_DEFAULT_TEMP_C;
+  if (!save_calibration(g_o2_cal_v, g_o2_cal_temp)) return;
+
+  DBG_PRINTF("[CAL] Calibration temp: %.2f degC\r\n", g_o2_cal_temp);
+  const O2Reading check = read_o2_percent_validated(g_o2_cal_temp);
+  if (check.valid) {
+    DBG_PRINTF("[CAL] Check O2 now: %.2f %%\r\n", check.o2);
+  } else {
+    DBG_PRINTF("[CAL] Check O2 now: invalid (%s)\r\n", o2_status_name(check.status));
+  }
+  DBG_PRINTLN("===============");
+  DBG_PRINTLN("");
 }
 
 static bool read_serial_line_with_timeout(String &out, uint32_t timeout_ms) {
@@ -568,117 +961,111 @@ static bool read_serial_line_with_timeout(String &out, uint32_t timeout_ms) {
   return false;
 }
 
-static bool wait_for_pin_low_continuous(uint32_t pin, uint32_t duration_ms) {
-  uint32_t low_since = 0;
-  uint32_t start = millis();
-
-  while ((millis() - start) < duration_ms) {
-    if (digitalRead(pin) == LOW) {
-      if (low_since == 0) {
-        low_since = millis();
-      }
-      if ((millis() - low_since) >= duration_ms) {
-        return true;
-      }
-    } else {
-      low_since = 0;
-    }
-    delay(5);
-  }
-
-  return low_since != 0 && (millis() - low_since) >= duration_ms;
-}
-
-static void run_o2_calibration(float cal_gas_o2_pct) {
-  DBG_PRINTF("[CAL] Starting O2 calibration at %.2f%% O2...\r\n", cal_gas_o2_pct);
-  DBG_PRINTLN("[CAL] Keep sensor in stable calibration gas / fresh air");
-
-  float avg_v = read_o2_voltage_stabilized();
-  if (!isfinite(avg_v) || avg_v < 0.05f || avg_v > 3.0f) {
-    DBG_PRINTF("[CAL] ERROR: Invalid calibration voltage %.4f V\r\n", avg_v);
-    return;
-  }
-
-  float new_ref = avg_v * (20.9f / cal_gas_o2_pct);
-  if (!isfinite(new_ref) || new_ref < 0.05f || new_ref > 3.0f) {
-    DBG_PRINTF("[CAL] ERROR: Calculated reference is invalid %.4f V\r\n", new_ref);
-    return;
-  }
-
-  g_o2_calibration_vref = new_ref;
-  DBG_PRINTF("[CAL] Measured average voltage: %.4f V\r\n", avg_v);
-  DBG_PRINTF("[CAL] New runtime reference: %.4f V at 20.9%% O2\r\n", g_o2_calibration_vref);
-  DBG_PRINTF("[CAL] Persist in code: O2_VOLTAGE_AT_20_9_PCT = %.4ff\r\n", g_o2_calibration_vref);
-}
-
 static void run_o2_calibration_from_boot_prompt() {
-  float cal_gas_o2_pct = 20.9f;
+  float cal_gas_o2 = O2_DEFAULT_CAL_GAS;
 
-  DBG_PRINTLN("[CAL] Waiting 5 seconds for optional calibration gas input...");
-  DBG_PRINTLN("[CAL] Enter O2% + Enter within 5s, or wait for default 20.90%");
-  DBG_PRINT("[CAL] Input> ");
+  DBG_PRINTLN("[CAL] Calibration mode active.");
+  DBG_PRINTF("[CAL] Default gas = %.2f%% (fresh air).\r\n", O2_DEFAULT_CAL_GAS);
+  DBG_PRINTF("[CAL] Enter other O2%% within %lus + Enter, or wait to use %.2f.\r\n",
+             (unsigned long)(CAL_GAS_INPUT_TIMEOUT_MS / 1000UL), O2_DEFAULT_CAL_GAS);
+  DBG_PRINT("> ");
 
   String line;
   if (read_serial_line_with_timeout(line, CAL_GAS_INPUT_TIMEOUT_MS)) {
     line.trim();
     if (line.length() > 0) {
       line.replace(',', '.');
-      float entered = line.toFloat();
-      if (entered > 0.0f && entered < 30.0f) {
-        cal_gas_o2_pct = entered;
-        DBG_PRINTF("[CAL] Using entered gas: %.2f%%\r\n", cal_gas_o2_pct);
+      float v = line.toFloat();
+      if (v > O2_PERCENT_MIN_VALID && v < O2_PERCENT_CAL_INPUT_MAX) {
+        cal_gas_o2 = v;
+        DBG_PRINTF("[CAL] Using entered gas: %.2f\r\n", cal_gas_o2);
       } else {
-        DBG_PRINTLN("[CAL] Invalid input -> using 20.90%");
+        DBG_PRINTLN("[CAL] Invalid input -> using default gas.");
       }
     } else {
-      DBG_PRINTLN("[CAL] Empty input -> using 20.90%");
+      DBG_PRINTLN("[CAL] Empty -> using default gas.");
     }
   } else {
     DBG_PRINTLN("");
-    DBG_PRINTLN("[CAL] No input -> using 20.90%");
+    DBG_PRINTLN("[CAL] No input -> using default gas.");
   }
 
-  run_o2_calibration(cal_gas_o2_pct);
+  DBG_PRINTLN("[CAL] Starting warm-up and stability check...");
+  run_o2_auto_calibration(cal_gas_o2);
 }
 
 // ================= PAYLOAD =================
-static PayloadV1 make_payload(float o2_raw, float temp_c, float humidity_pct, uint8_t bat_pct) {
+static PayloadV1 make_payload(const O2Reading &o2_reading, float temp_c, float humidity_pct, uint8_t bat_pct) {
   PayloadV1 payload = {};
-
-  float o2_tx = o2_raw;
-  if (!isfinite(o2_tx)) o2_tx = 0.0f;
-  if (o2_tx < 0.0f) o2_tx = 0.0f;
-  if (o2_tx > 20.0f) o2_tx = 20.9f;
-
-  if (!isfinite(temp_c)) temp_c = 0.0f;
-  if (!isfinite(humidity_pct)) humidity_pct = 0.0f;
-
   payload.msgType = 0x01;
-  payload.o2_x10  = (uint16_t)lroundf(o2_tx * 10.0f);
-  payload.t_x10   = (int16_t)lroundf(temp_c * 10.0f);
-  payload.h_x10   = (uint16_t)lroundf(humidity_pct * 10.0f);
-  payload.bat_pct = (uint8_t)constrain((int)bat_pct, 0, 100);
 
+  // Keep the 8-byte payload unchanged by reserving 65535 as an invalid O2 marker.
+  // Valid high-air readings are normalized to 20.9% for a clean overview across sensors.
+  if (o2_reading.valid) {
+    float o2c = o2_reading.o2;
+    if (o2c < O2_PERCENT_MIN_VALID) o2c = O2_PERCENT_MIN_VALID;
+    if (o2c > O2_PERCENT_MAX_VALID) o2c = O2_PERCENT_MAX_VALID;
+    if (o2c > O2_PERCENT_AIR_DISPLAY_CAP) o2c = O2_DEFAULT_CAL_GAS;
+    payload.o2_x10 = (uint16_t)lroundf(o2c * 10.0f);
+  } else {
+    payload.o2_x10 = O2_PAYLOAD_INVALID_MARKER;
+  }
+
+  payload.t_x10   = isfinite(temp_c) ? (int16_t)lroundf(temp_c * 10.0f) : T_PAYLOAD_INVALID_MARKER;
+  payload.h_x10   = isfinite(humidity_pct) ? (uint16_t)lroundf(humidity_pct * 10.0f) : H_PAYLOAD_INVALID_MARKER;
+  payload.bat_pct = (uint8_t)constrain((int)bat_pct, 0, 100);
   return payload;
 }
 
-static void log_payload_preview(const PayloadV1 &payload,
-                                float o2_raw,
-                                float temp_c,
-                                float humidity_pct,
-                                float vbat) {
-  DBG_PRINTLN("[PAYLOAD] Preview:");
-  DBG_PRINTF("  Raw O2:       %.2f %%\r\n", o2_raw);
-  DBG_PRINTF("  Temperature:  %.2f C\r\n", temp_c);
-  DBG_PRINTF("  Humidity:     %.2f %%RH\r\n", humidity_pct);
-  DBG_PRINTF("  Battery:      %.3f V (%u%%)\r\n", vbat, payload.bat_pct);
-  DBG_PRINTF("  msgType:      0x%02X\r\n", payload.msgType);
-  DBG_PRINTF("  o2_x10:       %u\r\n", payload.o2_x10);
-  DBG_PRINTF("  t_x10:        %d\r\n", payload.t_x10);
-  DBG_PRINTF("  h_x10:        %u\r\n", payload.h_x10);
-  DBG_PRINT("  Bytes:        ");
+static void log_payload_preview(const PayloadV1 &payload) {
+  DBG_PRINTLN("[DEBUG] Payload preview (NOT sent):");
+  DBG_PRINTF("  msgType: 0x%02X\r\n", payload.msgType);
+  DBG_PRINTF("  o2_x10:  %u\r\n", payload.o2_x10);
+  DBG_PRINTF("  t_x10:   %d\r\n", payload.t_x10);
+  DBG_PRINTF("  h_x10:   %u\r\n", payload.h_x10);
+  DBG_PRINTF("  bat:     %u\r\n", payload.bat_pct);
+  DBG_PRINT("  HEX:     ");
   print_hex_compact((const uint8_t *)&payload, sizeof(payload));
   DBG_PRINTLN("");
+}
+
+static void run_debug_status() {
+  float temp_c = NAN;
+  float humidity_pct = NAN;
+  (void)bme280_read(temp_c, humidity_pct);
+  const O2Reading o2 = read_o2_percent_validated(temp_c);
+  const float vbat = read_battery_voltage();
+  const uint8_t bat_pct = battery_percent(vbat);
+  const PayloadV1 preview = make_payload(o2, temp_c, humidity_pct, bat_pct);
+
+  DBG_PRINTLN("");
+  DBG_PRINTLN("----- DEBUG STATUS -----");
+  DBG_PRINTF("[DEBUG] Temp: %.2f C\r\n", temp_c);
+  DBG_PRINTF("[DEBUG] RH:   %.2f %%\r\n", humidity_pct);
+  DBG_PRINTF("[DEBUG] Battery: %.3f V (%u%%)\r\n", vbat, bat_pct);
+  DBG_PRINTF("[DEBUG] O2 status: %s\r\n", o2_status_name(o2.status));
+  DBG_PRINTF("[DEBUG] O2 ADC avg: %.1f\r\n", o2.adc);
+  DBG_PRINTF("[DEBUG] O2 ADC min: %.1f\r\n", o2.adc_min);
+  DBG_PRINTF("[DEBUG] O2 ADC max: %.1f\r\n", o2.adc_max);
+  if (!o2.open_circuit_tested) {
+    DBG_PRINTLN("[DEBUG] O2 open-circuit test: not needed");
+  } else {
+    DBG_PRINTF("[DEBUG] O2 open-circuit test: %s\r\n", o2.open_circuit ? "FLOATING" : "connected");
+  }
+  if (o2.valid) {
+    DBG_PRINTF("[DEBUG] O2 value: %.2f %%\r\n", o2.o2);
+    DBG_PRINTF("[DEBUG] O2 tx : %.2f %%\r\n",
+               o2.o2 > O2_PERCENT_AIR_DISPLAY_CAP ? O2_DEFAULT_CAL_GAS : o2.o2);
+  } else {
+    DBG_PRINTLN("[DEBUG] O2 value: invalid");
+    DBG_PRINTLN("[DEBUG] O2 tx : invalid");
+  }
+  DBG_PRINTF("[DEBUG] O2 reference: %.5f V @ 20.9%%\r\n", g_o2_cal_v);
+  DBG_PRINTF("[DEBUG] O2 cal temp: %.2f degC\r\n", g_o2_cal_temp);
+  DBG_PRINTF("[DEBUG] O2 temp comp factor: %.4f\r\n",
+             o2_relative_output_pct(g_o2_cal_temp) / o2_relative_output_pct(temp_c));
+  log_payload_preview(preview);
+  DBG_PRINTLN("------------------------");
 }
 
 // ================= LORAWAN =================
@@ -766,6 +1153,7 @@ static bool configure_lorawan() {
   log_lorawan_runtime_config();
   return true;
 }
+
 static bool run_join_attempts() {
   for (uint8_t attempt = 1; attempt <= JOIN_MAX_ATTEMPTS; attempt++) {
     DBG_PRINTF("[JOIN] Attempt %u/%u: starting OTAA join...\r\n",
@@ -864,50 +1252,44 @@ static bool wait_for_send_result(uint32_t timeout_ms) {
   return false;
 }
 
-static bool send_measurement_payload() {
-  if (!g_bme_ready) {
-    DBG_PRINTLN("[SENS] BME280 is not ready, skipping payload send");
-    return false;
-  }
-
-  sensor_power_on();
-  delay(100);
-
-  float temp_c = bme280_read_temperature();
-  float humidity_pct = bme280_read_humidity();
-  float o2_raw = read_o2_percent_raw_stabilized();
-  float vbat = read_battery_voltage();
-  uint8_t bat_pct = battery_percent(vbat);
-
-  PayloadV1 payload = make_payload(o2_raw, temp_c, humidity_pct, bat_pct);
-  log_payload_preview(payload, o2_raw, temp_c, humidity_pct, vbat);
+static bool send_measurement_payload(uint8_t bat_pct) {
+  // Without BME280: O2 + battery still sent, T/RH as invalid markers, no live temp comp
+  float temp_c = NAN;
+  float humidity_pct = NAN;
+  (void)bme280_read(temp_c, humidity_pct);
+  const O2Reading o2 = read_o2_percent_production_validated(temp_c);
+  PayloadV1 payload = make_payload(o2, temp_c, humidity_pct, bat_pct);
 
   g_send_event_seen = false;
   g_last_send_status = INT32_MIN;
-
-  DBG_PRINTF("[SEND] Requesting uplink on FPort %u (%s)\r\n",
-             LORA_FPORT, LORA_CONFIRMED_UPLINK ? "confirmed" : "unconfirmed");
 
   if (!api.lorawan.send(sizeof(payload),
                         (uint8_t *)&payload,
                         LORA_FPORT,
                         LORA_CONFIRMED_UPLINK,
                         LORA_SEND_RETRY)) {
-    DBG_PRINTLN("[SEND] Start failed: stack did not accept the uplink request");
-    sensor_power_off();
     return false;
   }
 
-  bool ok = wait_for_send_result(15000UL);
-  sensor_power_off();
-  return ok;
+  return wait_for_send_result(SEND_RESULT_TIMEOUT_MS);
 }
 
 // ================= SETUP =================
 void setup() {
+  pinMode(TPL_DONE_PIN, OUTPUT);
+  digitalWrite(TPL_DONE_PIN, LOW);
+
+  // ---- Load stored calibration early ----
+  float stored_cal_v = 0.0f;
+  float stored_cal_temp = O2_CAL_DEFAULT_TEMP_C;
+  const bool has_stored = load_calibration(stored_cal_v, stored_cal_temp);
+  if (has_stored) {
+    g_o2_cal_v    = stored_cal_v;
+    g_o2_cal_temp = stored_cal_temp;
+  }
+
+  // ---- Determine mode ONLY by PA4 low at boot (within window) ----
   pinMode(SERVICE_MODE_PIN, INPUT_PULLUP);
-  pinMode(PWR_ENABLE_PIN, OUTPUT);
-  sensor_power_off();
   uint32_t trigger_start = millis();
   while ((millis() - trigger_start) < DEBUG_BOOT_WINDOW_MS) {
     if (digitalRead(SERVICE_MODE_PIN) == LOW) {
@@ -920,120 +1302,97 @@ void setup() {
   if (g_debug_mode) {
     Serial.begin(115200, RAK_AT_MODE);
     delay(1200);
-  }
 
-  if (g_debug_mode) {
     DBG_PRINTLN("");
-    DBG_PRINTLN("========================================");
-    DBG_PRINTLN("=== RAK3172 RUI O2 + BME280 SENSOR   ===");
-    DBG_PRINTLN("=== VS Code / Join-first build       ===");
-    DBG_PRINTLN("========================================");
-    DBG_PRINTLN("[MODE] Debug/calibration mode enabled");
-    DBG_PRINTLN("[MODE] Hold PA4 LOW at boot for service/debug mode");
+    DBG_PRINTLN("=== System Boot (RAK3172) ===");
+    DBG_PRINTLN("[BOOT] Mode: DEBUG+CAL (PA4 LOW)");
     log_rui_versions();
-
-    sensor_power_on();
-    delay(100);
-    run_o2_calibration_from_boot_prompt();
-    sensor_power_off();
+    DBG_PRINTF("[BOOT] O2 reference default: %.5f V\r\n", O2_CAL_V_DEFAULT);
+    if (has_stored) {
+      DBG_PRINTF("[BOOT] Loaded O2 reference from flash: %.5f V\r\n", g_o2_cal_v);
+      DBG_PRINTF("[BOOT] Loaded calibration temp: %.2f degC\r\n", g_o2_cal_temp);
+    } else {
+      DBG_PRINTLN("[BOOT] No valid flash calibration found -> using default.");
+    }
+    DBG_PRINTF("[BOOT] PayloadV1 size: %u\r\n", (unsigned)sizeof(PayloadV1));
   }
 
+  // UART1 (PB6/PB7) is unused on the v4 board; disable it to save power
   Serial1.end();
-  pinMode(PB6, INPUT);
-  pinMode(PB7, INPUT);
-  DBG_PRINTLN("[UART1] Serial1 disabled to free PB6/PB7 for I2C");
 
   analogReadResolution(10);
   pinMode(BAT_ADC_PIN, INPUT);
   pinMode(O2_ADC_PIN, INPUT);
-  DBG_PRINTLN("[ADC] Battery on PB3, O2 on PB2");
 
-  pinMode(I2C_SDA_PIN, INPUT);
-  pinMode(I2C_SCL_PIN, INPUT);
-  Wire.begin();
-  DBG_PRINTLN("[I2C] Wire ready on PB7/PB6");
-
-  sensor_power_on();
-  delay(100);
-  DBG_PRINTLN("[BME] Initializing...");
+  // ---- BME280 init (before calibration: needed for calibration temp) ----
+  i2c_bus_recover();
   g_bme_ready = bme280_init();
+  if (!g_bme_ready) {
+    delay(100);
+    i2c_bus_recover();
+    g_bme_ready = bme280_init();
+  }
   if (g_bme_ready) {
-    float t = bme280_read_temperature();
-    float h = bme280_read_humidity();
-    DBG_PRINTF("[BME] OK, test reading %.2f C / %.2f %%RH\r\n", t, h);
+    DBG_PRINTLN("[BME] OK");
   } else {
-    DBG_PRINTLN("[BME] FAILED - join diagnostics can still run");
+    DBG_PRINTLN("[BME] Sensor not found!");
   }
 
-  float vbat = read_battery_voltage();
-  float o2 = read_o2_percent_raw_stabilized();
-  DBG_PRINTLN("[SENS] Boot sanity check:");
-  DBG_PRINTF("  Battery: %.3f V (%u%%)\r\n", vbat, battery_percent(vbat));
-  DBG_PRINTF("  O2 raw:  %.2f %%\r\n", o2);
-
+  // ---- Calibration when PA4 low; daarna blijven we in debug mode zonder uplinks ----
   if (g_debug_mode) {
-    DBG_PRINTLN("[CAL] PA4 debug mode active");
-  }
-  sensor_power_off();
+    // Self-test: the pull-up probe must not break later analogRead() calls
+    const float adc_before = read_o2_adc_avg_counts();
+    const bool floating = is_o2_input_floating();
+    const float adc_after = read_o2_adc_avg_counts();
+    DBG_PRINTF("[O2] Open-circuit probe self-test: ADC %.1f -> %.1f, input %s\r\n",
+               adc_before, adc_after, floating ? "HIGH" : "LOW");
 
-  if (!configure_lorawan()) {
-    DBG_PRINTLN("[INIT] LoRaWAN configuration failed");
-    DBG_PRINTLN("========================================");
+    run_o2_calibration_from_boot_prompt();
+    DBG_PRINTF("[MODE] Debug mode: no join, no uplink. Status every 30s. Auto-switch to production after %lu min.\r\n",
+               (unsigned long)(DEBUG_MODE_MAX_MS / 60000UL));
     return;
   }
 
-  DBG_PRINTF("[MODE] Join diagnostics only: %s\r\n", JOIN_DIAGNOSTICS_ONLY ? "YES" : "NO");
-  DBG_PRINTF("[MODE] Low power sleep:       %s\r\n", ENABLE_LOW_POWER_SLEEP ? "YES" : "NO");
-  DBG_PRINTLN("========================================");
+  g_lora_ready = configure_lorawan();
 }
 
 // ================= LOOP =================
 void loop() {
-  static uint32_t last_send_at = 0;
-  static uint32_t last_debug_o2_log_at = 0;
-
-  if (!ensure_joined()) {
-    delay(JOIN_RETRY_DELAY_MS);
-    return;
-  }
-
-  if (JOIN_DIAGNOSTICS_ONLY) {
-    DBG_PRINTLN("[JOIN] Diagnostics mode active, no sensor payload will be sent");
-    delay(5000);
-    return;
-  }
-
-  uint32_t now = millis();
-  if (g_debug_mode && (last_debug_o2_log_at == 0 || (now - last_debug_o2_log_at) >= DEBUG_O2_LOG_INTERVAL_MS)) {
-    sensor_power_on();
+  // ==========================================================
+  // MODE 1: DEBUG+CAL -> Serial prints + payload preview, NO uplink
+  // ==========================================================
+  if (g_debug_mode && millis() >= DEBUG_MODE_MAX_MS) {
+    DBG_PRINTLN("[MODE] Debug time limit reached -> switching to production (PA4 jumper ignored)");
+    DBG_PRINTLN("[MODE] Serial logging stops now.");
     delay(100);
-    float o2 = read_o2_percent_raw_stabilized();
-    sensor_power_off();
-    DBG_PRINTF("[DBG] O2 raw: %.2f %%\r\n", o2);
-    last_debug_o2_log_at = now;
+    g_debug_mode = false;
+    g_lora_ready = configure_lorawan();
   }
 
-  if (last_send_at == 0 || (now - last_send_at) >= SEND_INTERVAL_MS) {
-    last_send_at = now;
-    DBG_PRINTF("[SEND] Uptime %.1f min, starting payload cycle\r\n",
-               millis() / 60000.0f);
-    send_measurement_payload();
-    DBG_PRINTLN("----------------------------------------");
-  }
-
-  if (ENABLE_LOW_POWER_SLEEP) {
-    uint32_t sleep_ms = 1000UL;
-    if (!g_debug_mode && last_send_at != 0) {
-      uint32_t elapsed = millis() - last_send_at;
-      if (elapsed < SEND_INTERVAL_MS) {
-        sleep_ms = SEND_INTERVAL_MS - elapsed;
-      }
-      if (sleep_ms > 60000UL) {
-        sleep_ms = 60000UL;
-      }
+  if (g_debug_mode) {
+    static uint32_t last_preview_at = 0;
+    static bool first_preview = true;
+    if (first_preview || (millis() - last_preview_at) >= DEBUG_PAYLOAD_PREVIEW_MS) {
+      first_preview = false;
+      last_preview_at = millis();
+      run_debug_status();
     }
-    api.system.sleep.all(sleep_ms);
-  } else {
-    delay(1000);
+    delay(100);
+    return;
   }
+
+  // ==========================================================
+  // MODE 2: PRODUCTIE -> uplink, daarna batterij-afhankelijke RUI sleep
+  // ==========================================================
+  const float vbat = read_battery_voltage();
+  const uint8_t bat_pct = battery_percent(vbat);
+  if (bat_pct < BAT_CUTOFF_PCT) {
+    battery_cutoff_two_months(); // keert niet terug
+  }
+
+  if (g_lora_ready && ensure_joined()) {
+    (void)send_measurement_payload(bat_pct);
+  }
+
+  sleep_for_ms(sleep_ms_for_battery_pct(bat_pct));
 }
